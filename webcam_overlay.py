@@ -128,29 +128,51 @@ class _CameraWorker(threading.Thread):
         if not _CV2:
             return
 
-        cap = cv2.VideoCapture(self._device)
-        if not cap.isOpened():
-            log.warning('WebcamOverlay: could not open camera device %d', self._device)
-            return
-
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, float(self._width))
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(self._height))
-        cap.set(cv2.CAP_PROP_FPS, float(self._fps))
-        self._active = True
-
         period = 1.0 / max(1, self._fps)
-        while not self._stop.is_set():
-            ok, frame = cap.read()
-            if ok and frame is not None:
-                # Convert BGR->RGB and mirror for selfie feel.
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                frame = cv2.flip(frame, 1)
-                with self._lock:
-                    self._latest = frame
-            time.sleep(period * 0.45)
 
-        cap.release()
-        self._active = False
+        # Outer retry loop: re-open camera if it becomes unavailable.
+        while not self._stop.is_set():
+            cap = cv2.VideoCapture(self._device)
+            if not cap.isOpened():
+                log.warning(
+                    'WebcamOverlay: camera %d unavailable, retrying in 3 s…',
+                    self._device,
+                )
+                self._stop.wait(3.0)
+                continue
+
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, float(self._width))
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(self._height))
+            cap.set(cv2.CAP_PROP_FPS, float(self._fps))
+            self._active = True
+            log.info('WebcamOverlay: camera %d opened', self._device)
+
+            fail_count = 0
+            # Inner capture loop; breaks on repeated failures to trigger reconnect.
+            while not self._stop.is_set():
+                ok, frame = cap.read()
+                if ok and frame is not None:
+                    # Convert BGR→RGB and mirror for selfie feel.
+                    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    frame = cv2.flip(frame, 1)
+                    with self._lock:
+                        self._latest = frame
+                    fail_count = 0
+                else:
+                    fail_count += 1
+                    if fail_count >= 20:
+                        log.warning(
+                            'WebcamOverlay: camera %d stopped responding, reconnecting…',
+                            self._device,
+                        )
+                        break
+                self._stop.wait(period * 0.45)
+
+            cap.release()
+            self._active = False
+            if not self._stop.is_set():
+                log.info('WebcamOverlay: waiting 2 s before reconnect…')
+                self._stop.wait(2.0)
 
     def stop(self) -> None:
         self._stop.set()
