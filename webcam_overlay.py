@@ -12,6 +12,7 @@ Keypad layout presets expected by hotkeys:
 from __future__ import annotations
 
 import logging
+import sys
 import threading
 import time
 from pathlib import Path
@@ -124,6 +125,21 @@ class _CameraWorker(threading.Thread):
         self._latest: np.ndarray | None = None
         self._active = False
 
+    def _try_open(self, dev: int) -> 'cv2.VideoCapture | None':
+        """Open camera with V4L2 backend on Linux, default on Windows."""
+        if sys.platform != 'win32':
+            log.debug('WebcamOverlay effect: trying /dev/video%d (V4L2)', dev)
+            cap = cv2.VideoCapture(dev, cv2.CAP_V4L2)
+        else:
+            cap = cv2.VideoCapture(dev)
+        if not cap.isOpened():
+            log.debug('WebcamOverlay effect: device %d open failed', dev)
+            cap.release()
+            return None
+        if sys.platform != 'win32':
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+        return cap
+
     def run(self) -> None:
         if not _CV2:
             return
@@ -132,10 +148,16 @@ class _CameraWorker(threading.Thread):
 
         # Outer retry loop: re-open camera if it becomes unavailable.
         while not self._stop.is_set():
-            cap = cv2.VideoCapture(self._device)
-            if not cap.isOpened():
+            if sys.platform != 'win32':
+                cap = self._try_open(self._device)
+            else:
+                raw = cv2.VideoCapture(self._device)
+                cap = raw if raw.isOpened() else None
+                if cap is None:
+                    raw.release()
+            if cap is None:
                 log.warning(
-                    'WebcamOverlay: camera %d unavailable, retrying in 3 s…',
+                    'WebcamOverlay effect: camera %d unavailable, retrying in 3 s…',
                     self._device,
                 )
                 self._stop.wait(3.0)
@@ -242,15 +264,23 @@ class WebcamOverlay(BaseEffect):
 
         # Camera configuration from effect config section.
         self._cam_device = int(self.config.get('camera_device', 0))
-        self._cam_width = int(self.config.get('camera_width', 1280))
-        self._cam_height = int(self.config.get('camera_height', 720))
-        self._cam_fps = int(self.config.get('camera_fps', 30))
+        self._cam_width  = int(self.config.get('camera_width',  1280))
+        self._cam_height = int(self.config.get('camera_height',  720))
+        self._cam_fps    = int(self.config.get('camera_fps',      30))
+
+        self._enabled_effect = str(self.config.get('enabled', 'true')).lower() != 'false'
+        if not self._enabled_effect:
+            log.info('WebcamOverlay effect: disabled via config')
 
         self._layout = str(self.config.get('pip_position', 'bottom_right')).lower()
         self._hidden = False
 
-        self._worker = _CameraWorker(self._cam_device, self._cam_width, self._cam_height, self._cam_fps)
-        self._worker.start()
+        self._worker: '_CameraWorker | None' = None
+        if self._enabled_effect:
+            self._worker = _CameraWorker(self._cam_device, self._cam_width, self._cam_height, self._cam_fps)
+            self._worker.start()
+        else:
+            log.info('WebcamOverlay effect: camera worker not started (disabled)')
 
         # Fallback texture shown when camera is unavailable.
         fallback = np.zeros((256, 256, 3), dtype=np.uint8)
@@ -422,7 +452,8 @@ class WebcamOverlay(BaseEffect):
         self._cam_vao.render(moderngl.TRIANGLES)
 
     def destroy(self) -> None:
-        self._worker.stop()
+        if self._worker is not None:
+            self._worker.stop()
         self._bg_vao.release()
         self._bg_vbo.release()
         self._bg_prog.release()
