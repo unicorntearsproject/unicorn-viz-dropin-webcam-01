@@ -356,6 +356,8 @@ class WebcamSystem:
 
     def set_layout(self, token: str) -> str:
         token = token.lower().strip()
+        if token == 'hidden':
+            token = 'hide'
         if token in self._KEYPAD_TO_LAYOUT:
             token = self._KEYPAD_TO_LAYOUT[token]
         if token == 'hide':
