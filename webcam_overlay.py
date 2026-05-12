@@ -164,6 +164,8 @@ _TREATMENT_NAMES: list[str] = ['raw', 'neon', 'glitch', 'vintage', 'thermal']
 class _CameraWorker(threading.Thread):
     """Background camera capture thread."""
 
+    _MAX_OPEN_FAILURES = 5  # give up after this many consecutive not-found attempts
+
     def __init__(self, device: int, width: int, height: int, fps: int) -> None:
         super().__init__(daemon=True, name='webcam-capture')
         self._device = int(device)
@@ -195,6 +197,7 @@ class _CameraWorker(threading.Thread):
 
         period = 1.0 / max(1, self._fps)
 
+        open_failures = 0
         while not self._stop.is_set():
             cap = None
             for offset in range(3):
@@ -205,10 +208,22 @@ class _CameraWorker(threading.Thread):
                     break
 
             if cap is None:
-                log.warning('WebcamSystem: no camera found at devices %d..%d, retrying in 3 s',
-                            self._device, self._device + 2)
+                open_failures += 1
+                if open_failures == 1:
+                    log.warning(
+                        'WebcamSystem: no camera found at devices %d..%d, retrying',
+                        self._device, self._device + 2,
+                    )
+                if open_failures >= self._MAX_OPEN_FAILURES:
+                    log.warning(
+                        'WebcamSystem: camera not available after %d attempts — giving up',
+                        open_failures,
+                    )
+                    return
                 self._stop.wait(3.0)
                 continue
+
+            open_failures = 0  # reset on successful open
 
             cap.set(cv2.CAP_PROP_FRAME_WIDTH,  float(self._width))
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(self._height))
