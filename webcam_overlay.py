@@ -292,6 +292,10 @@ class WebcamSystem:
         self._cam_height = int(cfg.get('height', 720))
         self._cam_fps    = int(cfg.get('fps',    30))
         self._pip_scale  = float(cfg.get('pip_scale', 0.33))
+        self._border_thickness = max(0.0, float(cfg.get('border_thickness', 8.0)))
+        self._border_color = self._parse_border_color(
+            cfg.get('border_color', (0.04, 0.72, 1.0, 0.28))
+        )
         self._layout     = 'bottom_right'
         self._hidden     = False
         # Route through set_layout so 'hidden' correctly sets self._hidden.
@@ -372,6 +376,28 @@ class WebcamSystem:
         self._pip_scale = max(0.12, min(0.80, self._pip_scale + delta))
         return self._pip_scale
 
+    def _parse_border_color(self, value) -> tuple[float, float, float, float]:
+        if isinstance(value, (tuple, list)):
+            parts = list(value)
+        elif isinstance(value, str):
+            text = value.strip()
+            if text.startswith('#') and len(text) in (7, 9):
+                r = int(text[1:3], 16) / 255.0
+                g = int(text[3:5], 16) / 255.0
+                b = int(text[5:7], 16) / 255.0
+                a = int(text[7:9], 16) / 255.0 if len(text) == 9 else 1.0
+                return (r, g, b, a)
+            parts = [p.strip() for p in text.split(',') if p.strip()]
+        else:
+            parts = []
+
+        floats = [float(v) for v in parts[:4]]
+        if len(floats) == 3:
+            floats.append(1.0)
+        while len(floats) < 4:
+            floats.append(0.0 if len(floats) < 3 else 1.0)
+        return tuple(max(0.0, min(1.0, v)) for v in floats[:4])
+
     def next_treatment(self) -> str:
         self._treatment_index = (self._treatment_index + 1) % len(_TREATMENT_NAMES)
         return _TREATMENT_NAMES[self._treatment_index]
@@ -408,13 +434,13 @@ class WebcamSystem:
         tex = self._get_camera_texture()
         x, y, w, h = self._rect_from_layout()
 
-        b = 6.0 + bass * 12.0
+        b = self._border_thickness + bass * (self._border_thickness * 0.75)
         sx = max(0, int(x - b))
         sy = max(0, int(self._height - (y + h + b)))
         sw = int(w + 2 * b)
         sh = int(h + 2 * b)
         self._ctx.scissor = (sx, sy, sw, sh)
-        self._ctx.clear(0.04, 0.72, 1.0, 0.28)
+        self._ctx.clear(*self._border_color)
         self._ctx.scissor = None
 
         self._write_cam_quad(x, y, w, h)

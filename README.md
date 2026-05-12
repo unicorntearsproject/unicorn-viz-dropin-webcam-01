@@ -43,6 +43,8 @@ pip_position    = "bottom_right" # top_left | top_center | top_right |
                                  # bottom_left | bottom_center | bottom_right |
                                  # fullscreen
 pip_scale       = 0.33           # fraction of viewport width (0.12–0.80)
+border_thickness = 8.0            # border/backplate thickness in pixels
+border_color     = [0.04, 0.72, 1.0, 0.28]  # RGBA values 0.0–1.0
 enabled         = true           # false disables camera worker
 ```
 
