@@ -292,8 +292,10 @@ class WebcamSystem:
         self._cam_height = int(cfg.get('height', 720))
         self._cam_fps    = int(cfg.get('fps',    30))
         self._pip_scale  = float(cfg.get('pip_scale', 0.33))
-        self._layout     = str(cfg.get('pip_position', 'bottom_right')).lower()
+        self._layout     = 'bottom_right'
         self._hidden     = False
+        # Route through set_layout so 'hidden' correctly sets self._hidden.
+        self.set_layout(str(cfg.get('pip_position', 'bottom_right')).lower())
 
         default_treatment = str(cfg.get('treatment', 'neon')).lower()
         if default_treatment not in _TREATMENT_NAMES:
