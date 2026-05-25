@@ -30,6 +30,17 @@ opencv-python-headless >= 4.9
 
 Already listed in the main `requirements.txt`.
 
+## Installer
+
+This drop-in ships a bundle installer script at `install.sh`.
+
+```bash
+bash install.sh --root ~/.local/share/unicorn-viz
+```
+
+The installer copies the bundle into `~/.local/share/unicorn-viz/drop-ins/webcam-01`
+by default. Use `--uninstall` to remove that bundle again.
+
 ## Config
 
 ```toml
