@@ -27,6 +27,7 @@ import logging
 import sys
 import threading
 from pathlib import Path
+from typing import Any
 
 import moderngl
 import numpy as np
@@ -276,6 +277,14 @@ class _CameraWorker(threading.Thread):
 class WebcamSystem:
     """Always-on camera overlay.  Not a playlist effect."""
 
+    HELP_ENTRIES: list[tuple[str, str, str]] = [
+        ('Camera Overlay', 'KP 1-9', 'PiP position'),
+        ('Camera Overlay', 'KP 0 / .', 'PiP fullscreen / hide'),
+        ('Camera Overlay', 'KP / *', 'Treatment prev / next'),
+        ('Camera Overlay', 'KP - +', 'PiP size'),
+        ('Camera Overlay', 'KP Enter', 'Treatment auto-cycle'),
+    ]
+
     _LAYOUTS: dict[str, tuple[float, float]] = {
         'top_left':      (0.04, 0.04),
         'top_center':    (0.50, 0.04),
@@ -351,6 +360,78 @@ class WebcamSystem:
         self._cam_tex_size = (0, 0)
         self._worker: _CameraWorker | None = None
         self._time = 0.0
+        self._vj_api: Any = None
+
+    def set_vj_api(self, api: Any) -> None:
+        """Inject the VJApi instance after construction."""
+        self._vj_api = api
+
+    def handle_key(self, sym: int, mod: int) -> 'str | None | bool':
+        """Handle webcam numpad layout + Alt+[/] PiP sizing keys."""
+        import sdl2  # noqa: PLC0415
+
+        # Alt+[ / Alt+] — PiP size down/up.
+        if mod & sdl2.KMOD_ALT:
+            if sym == sdl2.SDLK_LEFTBRACKET:
+                val: float = (self._vj_api.scale_pip(-0.05) if self._vj_api is not None
+                              else self.scale_pip(-0.05))
+                return f'Camera PiP: {val:.0%}' if val > 0 else 'Camera PiP not available'
+            if sym == sdl2.SDLK_RIGHTBRACKET:
+                val = (self._vj_api.scale_pip(0.05) if self._vj_api is not None
+                       else self.scale_pip(0.05))
+                return f'Camera PiP: {val:.0%}' if val > 0 else 'Camera PiP not available'
+
+        # Numpad layout controls.
+        layout_map = {
+            sdl2.SDLK_KP_1: '1', sdl2.SDLK_KP_2: '2', sdl2.SDLK_KP_3: '3',
+            sdl2.SDLK_KP_4: '4', sdl2.SDLK_KP_5: '5', sdl2.SDLK_KP_6: '6',
+            sdl2.SDLK_KP_7: '7', sdl2.SDLK_KP_8: '8', sdl2.SDLK_KP_9: '9',
+        }
+        labels = {
+            '1': 'bottom-left', '2': 'bottom-center', '3': 'bottom-right',
+            '4': 'left', '5': 'center', '6': 'right',
+            '7': 'top-left', '8': 'top-center', '9': 'top-right',
+        }
+        if sym in layout_map:
+            token = layout_map[sym]
+            if self._vj_api is not None:
+                if self._vj_api.set_camera_layout(token):
+                    return f'Camera: {labels[token]}'
+            elif self.set_layout(token):
+                return f'Camera: {labels[token]}'
+            return 'Camera: not available'
+        if sym == sdl2.SDLK_KP_0:
+            if self._vj_api is not None:
+                success = self._vj_api.set_camera_layout('0')
+            else:
+                success = bool(self.set_layout('0'))
+            return 'Camera: fullscreen' if success else 'Camera: not available'
+        if sym == sdl2.SDLK_KP_PERIOD:
+            if self._vj_api is not None:
+                success = self._vj_api.set_camera_layout('.')
+            else:
+                self._hidden = True
+                success = True
+            return 'Camera: hidden' if success else 'Camera: not available'
+
+        # Camera treatment cycling / PiP sizing (KP operator row).
+        if sym == sdl2.SDLK_KP_DIVIDE:
+            name = self._vj_api.goto_prev_webcam_effect() if self._vj_api else self.prev_treatment()
+            return f'Camera treatment: {name}' if name else 'Camera: not available'
+        if sym == sdl2.SDLK_KP_MULTIPLY:
+            name = self._vj_api.goto_next_webcam_effect() if self._vj_api else self.next_treatment()
+            return f'Camera treatment: {name}' if name else 'Camera: not available'
+        if sym == sdl2.SDLK_KP_MINUS:
+            pip_val = self._vj_api.scale_pip(-0.05) if self._vj_api else self.scale_pip(-0.05)
+            return f'Camera PiP: {pip_val:.0%}' if pip_val > 0 else 'Camera: not available'
+        if sym == sdl2.SDLK_KP_PLUS:
+            pip_val = self._vj_api.scale_pip(0.05) if self._vj_api else self.scale_pip(0.05)
+            return f'Camera PiP: {pip_val:.0%}' if pip_val > 0 else 'Camera: not available'
+        if sym == sdl2.SDLK_KP_ENTER:
+            active = self._vj_api.toggle_webcam_auto_cycle() if self._vj_api else self.toggle_auto_cycle()
+            return f'Camera treatment auto-cycle: {"ON" if active else "OFF"}'
+
+        return False
 
     def start(self) -> None:
         if not self.enabled:
