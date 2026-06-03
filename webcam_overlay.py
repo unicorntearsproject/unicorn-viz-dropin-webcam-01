@@ -13,6 +13,8 @@ Keypad controls (active at all times regardless of which effect is running):
     KP /          Previous camera treatment
     KP *          Next camera treatment
     KP Enter      Toggle auto-cycle camera treatments
+    Ctrl+KP /     Previous camera device
+    Ctrl+KP *     Next camera device
 
 Camera treatments:
     raw       Clean camera feed, minimal processing
@@ -198,6 +200,7 @@ class _CameraWorker(threading.Thread):
 
         period = 1.0 / max(1, self._fps)
 
+        initial_open = True  # True until first successful cap.isOpened()
         open_failures = 0
         while not self._stop.is_set():
             cap = None
@@ -209,21 +212,28 @@ class _CameraWorker(threading.Thread):
                     break
 
             if cap is None:
+                if initial_open:
+                    log.warning(
+                        'WebcamSystem: no camera at device %d..%d — giving up (reconnect and restart)',
+                        self._device, self._device + 2,
+                    )
+                    return
                 open_failures += 1
                 if open_failures == 1:
                     log.warning(
-                        'WebcamSystem: no camera found at devices %d..%d, retrying',
-                        self._device, self._device + 2,
+                        'WebcamSystem: camera lost at device %d, retrying',
+                        self._device,
                     )
                 if open_failures >= self._MAX_OPEN_FAILURES:
                     log.warning(
-                        'WebcamSystem: camera not available after %d attempts — giving up',
+                        'WebcamSystem: camera not available after %d reconnect attempts — giving up',
                         open_failures,
                     )
                     return
                 self._stop.wait(3.0)
                 continue
 
+            initial_open = False
             open_failures = 0  # reset on successful open
 
             cap.set(cv2.CAP_PROP_FRAME_WIDTH,  float(self._width))
@@ -283,6 +293,7 @@ class WebcamSystem:
         ('Camera Overlay', 'KP / *', 'Treatment prev / next'),
         ('Camera Overlay', 'KP - +', 'PiP size'),
         ('Camera Overlay', 'KP Enter', 'Treatment auto-cycle'),
+        ('Camera Overlay', 'Ctrl+KP / *', 'Camera device prev / next'),
     ]
 
     _LAYOUTS: dict[str, tuple[float, float]] = {
@@ -333,6 +344,9 @@ class WebcamSystem:
         self._auto_cycle = False
         self._auto_cycle_interval = float(cfg.get('cycle_interval', 30.0)) or 30.0
         self._auto_cycle_timer = 0.0
+
+        self._available_cameras: list[int] = []
+        self._camera_list_index: int = 0
 
         self._programs: dict[str, moderngl.Program] = {}
         for name, frag in _TREATMENT_FRAGS.items():
@@ -415,6 +429,14 @@ class WebcamSystem:
             return 'Camera: hidden' if success else 'Camera: not available'
 
         # Camera treatment cycling / PiP sizing (KP operator row).
+        if mod & sdl2.KMOD_CTRL:
+            if sym == sdl2.SDLK_KP_DIVIDE:
+                label = self._vj_api.goto_prev_camera() if self._vj_api else self.prev_camera()
+                return f'Camera device: {label}' if label else 'Camera: only one device'
+            if sym == sdl2.SDLK_KP_MULTIPLY:
+                label = self._vj_api.goto_next_camera() if self._vj_api else self.next_camera()
+                return f'Camera device: {label}' if label else 'Camera: only one device'
+
         if sym == sdl2.SDLK_KP_DIVIDE:
             name = self._vj_api.goto_prev_webcam_effect() if self._vj_api else self.prev_treatment()
             return f'Camera treatment: {name}' if name else 'Camera: not available'
@@ -439,12 +461,14 @@ class WebcamSystem:
         if not _CV2:
             log.error('WebcamSystem: opencv-python-headless not installed')
             return
-        self._worker = _CameraWorker(
-            self._device, self._cam_width, self._cam_height, self._cam_fps
-        )
-        self._worker.start()
-        log.info('WebcamSystem: started (treatment=%s, layout=%s)',
-                 self.current_treatment, self._layout)
+        self._available_cameras = self._enumerate_cameras()
+        if self._device in self._available_cameras:
+            self._camera_list_index = self._available_cameras.index(self._device)
+        else:
+            self._camera_list_index = 0
+        self._restart_worker()
+        log.info('WebcamSystem: started (treatment=%s, layout=%s, cameras=%s)',
+                 self.current_treatment, self._layout, self._available_cameras)
 
     def resize(self, w: int, h: int) -> None:
         self._width = w
@@ -506,6 +530,63 @@ class WebcamSystem:
         self._auto_cycle = not self._auto_cycle
         self._auto_cycle_timer = 0.0
         return self._auto_cycle
+
+    @staticmethod
+    def _enumerate_cameras() -> list[int]:
+        """Probe available video capture devices and return their indices."""
+        if not _CV2:
+            return []
+        found: list[int] = []
+        if sys.platform != 'win32':
+            import glob as _glob
+            for p in sorted(_glob.glob('/dev/video*')):
+                try:
+                    idx = int(Path(p).name.replace('video', ''))
+                except ValueError:
+                    continue
+                cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
+                if cap.isOpened():
+                    found.append(idx)
+                cap.release()
+        else:
+            for i in range(8):
+                cap = cv2.VideoCapture(i)
+                if cap.isOpened():
+                    found.append(i)
+                cap.release()
+        return found
+
+    def _restart_worker(self) -> None:
+        """Stop the current capture worker (if any) and start a new one."""
+        if self._worker is not None:
+            self._worker.stop()
+            self._worker.join(timeout=2.0)
+            self._worker = None
+        device = (
+            self._available_cameras[self._camera_list_index]
+            if self._available_cameras
+            else self._device
+        )
+        self._worker = _CameraWorker(device, self._cam_width, self._cam_height, self._cam_fps)
+        self._worker.start()
+
+    def next_camera(self) -> str | None:
+        """Switch to the next detected camera device. Returns a label or None if only one."""
+        if len(self._available_cameras) <= 1:
+            return None
+        self._camera_list_index = (self._camera_list_index + 1) % len(self._available_cameras)
+        self._restart_worker()
+        dev = self._available_cameras[self._camera_list_index]
+        return f'/dev/video{dev}' if sys.platform != 'win32' else str(dev)
+
+    def prev_camera(self) -> str | None:
+        """Switch to the previous detected camera device. Returns a label or None if only one."""
+        if len(self._available_cameras) <= 1:
+            return None
+        self._camera_list_index = (self._camera_list_index - 1) % len(self._available_cameras)
+        self._restart_worker()
+        dev = self._available_cameras[self._camera_list_index]
+        return f'/dev/video{dev}' if sys.platform != 'win32' else str(dev)
 
     @property
     def current_treatment(self) -> str:
@@ -617,6 +698,7 @@ class WebcamSystem:
     def destroy(self) -> None:
         if self._worker is not None:
             self._worker.stop()
+            self._worker.join(timeout=2.0)
             self._worker = None
         for vao in self._cam_vao_map.values():
             vao.release()
