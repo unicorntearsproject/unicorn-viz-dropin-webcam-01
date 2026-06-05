@@ -17,8 +17,25 @@ hotkey architecture, and upcoming control-room API surfaces.
    - Modal must support manual camera rediscovery/rescan.
    - Modal must expose live image controls for at least brightness and
      contrast.
+   - Modal must expose horizontal and vertical flip toggles.
    - Modal actions should be routed through public hotkey/control-room
      registration interfaces (no direct private runtime mutation from callers).
+   - Status (2026-06-05): complete for current scope.
+     - Added camera list + rediscovery + enable/disable APIs.
+     - Added brightness/contrast control APIs.
+     - Added horizontal/vertical flip control APIs.
+     - Added control-room wiring for camera/device/image controls.
+     - Added camera-switch auto-hide workaround (temporary until switch lag is
+       improved).
+     - Added dedicated webcam editor modal wiring (hotkey + routed modal
+       snapshot + runtime controls).
+     - Added direct camera select path (not only prev/next).
+     - Added explicit switching status indicator for operator surfaces.
+     - Added global runtime-state persistence for webcam state, including:
+       selected camera, disabled cameras, layout/PiP/treatment, and per-camera
+       brightness/contrast/flip settings.
+   - Decision (2026-06-05): keep-all-cameras-open hot-swap mode is explicitly
+     deferred; current policy remains single active camera open at a time.
 
 1. Monitor config modal integration (CR API dependent)
    - Add a monitor-config modal reachable by both:
@@ -51,13 +68,29 @@ hotkey architecture, and upcoming control-room API surfaces.
    - Record platform-specific constraints and fallback behavior where compositor
      limits prevent strict placement control.
 
+  4. Monitor editor v1 (control-room surface)
+     - Status (2026-06-05): in progress.
+     - Added control-room fullscreen monitor editor entry point.
+     - Added SDL-detected display topology map rendering.
+     - Added display mode buttons wired to supported span/mirror variants.
+     - Added include/exclude preference toggles saved to runtime-state for next
+       launch.
+     - Next: refine UX details based on operator feedback.
+
 ## Execution Notes
 
 - Item 1 is blocked pending control-room API availability.
 - Items 2 and 3 can proceed in parallel while CR API work is in flight.
 - Known issue note (2026-06-05): camera-device switching is stable on Fedora 44,
-  but currently locks the runtime on Windows 11 in recent operator testing.
-  This is now the next webcam bug track after current doc/cleanup work.
+  and Windows 11 validation pass has been completed for current workflow.
+  Status update: root-cause fix applied in webcam worker (`_stop` name
+  collision removed) and retested.
+- Outstanding webcam-specific items (2026-06-05):
+  - Done: fresh Windows 11 operator validation pass for repeated camera
+    switching under load.
+  - Done: switch-hide timing tuned for current operator workflow.
+  - N/A (deferred): guarded prewarm of neighboring cameras behind config
+    flags; keep disabled by default on Windows.
 - Use the multi-head docs and audits as implementation references:
   - `drop-ins/multi-head-01/docs/operations.md`
   - `drop-ins/multi-head-01/docs/troubleshooting.md`

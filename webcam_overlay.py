@@ -28,6 +28,7 @@ from __future__ import annotations
 import logging
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -176,7 +177,10 @@ class _CameraWorker(threading.Thread):
         self._height = int(height)
         self._fps = int(fps)
         self._lock = threading.Lock()
-        self._stop = threading.Event()
+        self._device_lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._switch_event = threading.Event()
+        self._requested_device = int(device)
         self._latest: np.ndarray | None = None
         self._active = False
 
@@ -202,7 +206,9 @@ class _CameraWorker(threading.Thread):
 
         initial_open = True  # True until first successful cap.isOpened()
         open_failures = 0
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
+            with self._device_lock:
+                self._device = int(self._requested_device)
             cap = None
             for offset in range(3):
                 cap = self._try_open(self._device + offset)
@@ -230,7 +236,7 @@ class _CameraWorker(threading.Thread):
                         open_failures,
                     )
                     return
-                self._stop.wait(3.0)
+                self._stop_event.wait(3.0)
                 continue
 
             initial_open = False
@@ -246,7 +252,12 @@ class _CameraWorker(threading.Thread):
                      int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
 
             fail_count = 0
-            while not self._stop.is_set():
+            switched_device = False
+            while not self._stop_event.is_set():
+                if self._switch_event.is_set():
+                    self._switch_event.clear()
+                    switched_device = True
+                    break
                 ok, frame = cap.read()
                 if ok and frame is not None:
                     frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -259,15 +270,22 @@ class _CameraWorker(threading.Thread):
                     if fail_count >= 20:
                         log.warning('WebcamSystem: camera stopped responding, reconnecting')
                         break
-                self._stop.wait(period * 0.45)
+                self._stop_event.wait(period * 0.45)
 
             cap.release()
             self._active = False
-            if not self._stop.is_set():
-                self._stop.wait(2.0)
+            if not self._stop_event.is_set() and not switched_device:
+                self._stop_event.wait(2.0)
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stop_event.set()
+        self._switch_event.set()
+
+    def request_device(self, device: int) -> None:
+        with self._device_lock:
+            self._requested_device = int(device)
+        log.debug('WebcamSystem: switch requested -> camera %d', int(device))
+        self._switch_event.set()
 
     def latest(self) -> np.ndarray | None:
         with self._lock:
@@ -333,6 +351,9 @@ class WebcamSystem:
         )
         self._layout     = 'bottom_right'
         self._hidden     = False
+        self._switch_hide_active = False
+        self._switch_hide_deadline = 0.0
+        self._switch_hide_duration_s = max(0.0, float(cfg.get('switch_hide_duration_s', 1.2)))
         # Route through set_layout so 'hidden' correctly sets self._hidden.
         self.set_layout(str(cfg.get('pip_position', 'bottom_right')).lower())
 
@@ -346,7 +367,20 @@ class WebcamSystem:
         self._auto_cycle_timer = 0.0
 
         self._available_cameras: list[int] = []
+        self._detected_cameras: list[int] = []
         self._camera_list_index: int = 0
+        self._disabled_cameras: set[int] = set()
+        self._active_device: int | None = None
+        self._camera_settings: dict[int, dict[str, float | bool]] = {}
+        self._brightness = max(0.2, min(2.0, float(cfg.get('brightness', 1.0))))
+        self._contrast = max(0.2, min(2.0, float(cfg.get('contrast', 1.0))))
+        self._flip_horizontal = str(cfg.get('flip_horizontal', 'true')).lower() != 'false'
+        self._flip_vertical = str(cfg.get('flip_vertical', 'false')).lower() == 'true'
+        self._default_brightness = float(self._brightness)
+        self._default_contrast = float(self._contrast)
+        self._default_flip_horizontal = bool(self._flip_horizontal)
+        self._default_flip_vertical = bool(self._flip_vertical)
+        self._remember_current_camera_settings(int(self._device))
 
         self._programs: dict[str, moderngl.Program] = {}
         for name, frag in _TREATMENT_FRAGS.items():
@@ -461,11 +495,7 @@ class WebcamSystem:
         if not _CV2:
             log.error('WebcamSystem: opencv-python-headless not installed')
             return
-        self._available_cameras = self._enumerate_cameras()
-        if self._device in self._available_cameras:
-            self._camera_list_index = self._available_cameras.index(self._device)
-        else:
-            self._camera_list_index = 0
+        self.rediscover_cameras()
         self._restart_worker()
         log.info('WebcamSystem: started (treatment=%s, layout=%s, cameras=%s)',
                  self.current_treatment, self._layout, self._available_cameras)
@@ -491,6 +521,33 @@ class WebcamSystem:
         if token == 'fullscreen' or token in self._LAYOUTS:
             self._layout = token
         return self._layout
+
+    def _active_or_default_device(self) -> int:
+        if self._active_device is not None:
+            return int(self._active_device)
+        return int(self._device)
+
+    def _remember_current_camera_settings(self, camera_id: int | None = None) -> None:
+        target_id = self._active_or_default_device() if camera_id is None else int(camera_id)
+        self._camera_settings[target_id] = {
+            'brightness': float(self._brightness),
+            'contrast': float(self._contrast),
+            'flip_horizontal': bool(self._flip_horizontal),
+            'flip_vertical': bool(self._flip_vertical),
+        }
+
+    def _apply_camera_settings(self, camera_id: int) -> None:
+        settings = self._camera_settings.get(int(camera_id))
+        if not isinstance(settings, dict):
+            self._brightness = float(self._default_brightness)
+            self._contrast = float(self._default_contrast)
+            self._flip_horizontal = bool(self._default_flip_horizontal)
+            self._flip_vertical = bool(self._default_flip_vertical)
+            return
+        self._brightness = max(0.2, min(2.0, float(settings.get('brightness', self._brightness))))
+        self._contrast = max(0.2, min(2.0, float(settings.get('contrast', self._contrast))))
+        self._flip_horizontal = bool(settings.get('flip_horizontal', self._flip_horizontal))
+        self._flip_vertical = bool(settings.get('flip_vertical', self._flip_vertical))
 
     def scale_pip(self, delta: float) -> float:
         self._pip_scale = max(0.12, min(0.80, self._pip_scale + delta))
@@ -556,25 +613,256 @@ class WebcamSystem:
                 cap.release()
         return found
 
-    def _restart_worker(self) -> None:
-        """Stop the current capture worker (if any) and start a new one."""
+    def _apply_camera_filter(self, detected: list[int]) -> list[int]:
+        return [idx for idx in detected if idx not in self._disabled_cameras]
+
+    def _rebuild_camera_list(self, detected: list[int]) -> list[int]:
+        self._detected_cameras = list(detected)
+        current_device = self._active_device
+        self._available_cameras = self._apply_camera_filter(detected)
+        if not self._available_cameras:
+            self._camera_list_index = 0
+            return self._available_cameras
+
+        preferred = current_device if current_device is not None else self._device
+        if preferred in self._available_cameras:
+            self._camera_list_index = self._available_cameras.index(preferred)
+        else:
+            self._camera_list_index = 0
+        return self._available_cameras
+
+    def list_cameras(self) -> list[dict[str, Any]]:
+        """Return detected camera list with enable/disable and selection state."""
+        detected = self._detected_cameras
+        selected = self._active_device
+        if selected is None and self._available_cameras:
+            selected = self._available_cameras[self._camera_list_index]
+        return [
+            {
+                'id': int(idx),
+                'label': f'/dev/video{idx}' if sys.platform != 'win32' else str(idx),
+                'enabled': idx not in self._disabled_cameras,
+                'selected': idx == selected,
+            }
+            for idx in detected
+        ]
+
+    def rediscover_cameras(self) -> list[int]:
+        """Re-probe camera devices and refresh enabled/selected state."""
+        detected = self._enumerate_cameras()
+        return self._rebuild_camera_list(detected)
+
+    def set_camera_enabled(self, camera_id: int, enabled: bool) -> bool:
+        """Enable or disable a detected camera index; returns success."""
+        camera_id = int(camera_id)
+        detected = self._detected_cameras
+        if camera_id not in detected:
+            return False
+        if enabled:
+            self._disabled_cameras.discard(camera_id)
+        else:
+            self._disabled_cameras.add(camera_id)
+        self._rebuild_camera_list(detected)
         if self._worker is not None:
-            self._worker.stop()
-            self._worker.join(timeout=2.0)
-            self._worker = None
+            if not self._available_cameras:
+                self._worker.stop()
+                self._worker.join(timeout=2.0)
+                self._worker = None
+                self._active_device = None
+            else:
+                self._restart_worker()
+        return True
+
+    def set_active_camera(self, camera_id: int) -> str | None:
+        """Switch directly to a specific enabled camera id and return its label."""
+        camera_id = int(camera_id)
+        self._rebuild_camera_list(self._detected_cameras)
+        if camera_id not in self._available_cameras:
+            return None
+        self._prepare_camera_switch_hide()
+        self._camera_list_index = self._available_cameras.index(camera_id)
+        self._restart_worker()
+        return f'/dev/video{camera_id}' if sys.platform != 'win32' else str(camera_id)
+
+    def set_brightness(self, value: float) -> float:
+        """Set software brightness multiplier and return clamped value."""
+        self._brightness = max(0.2, min(2.0, float(value)))
+        self._remember_current_camera_settings()
+        return self._brightness
+
+    def set_contrast(self, value: float) -> float:
+        """Set software contrast multiplier and return clamped value."""
+        self._contrast = max(0.2, min(2.0, float(value)))
+        self._remember_current_camera_settings()
+        return self._contrast
+
+    def adjust_brightness(self, delta: float) -> float:
+        """Adjust brightness by delta and return updated value."""
+        return self.set_brightness(self._brightness + float(delta))
+
+    def adjust_contrast(self, delta: float) -> float:
+        """Adjust contrast by delta and return updated value."""
+        return self.set_contrast(self._contrast + float(delta))
+
+    def _prepare_camera_switch_hide(self) -> None:
+        """Hide PiP during camera switch lag, then restore automatically."""
+        if self._hidden:
+            return
+        self._hidden = True
+        self._switch_hide_active = True
+        self._switch_hide_deadline = time.monotonic() + self._switch_hide_duration_s
+
+    def set_flip_horizontal(self, enabled: bool) -> bool:
+        """Enable or disable horizontal mirror flip on webcam frames."""
+        self._flip_horizontal = bool(enabled)
+        self._remember_current_camera_settings()
+        return self._flip_horizontal
+
+    def set_flip_vertical(self, enabled: bool) -> bool:
+        """Enable or disable vertical flip on webcam frames."""
+        self._flip_vertical = bool(enabled)
+        self._remember_current_camera_settings()
+        return self._flip_vertical
+
+    def toggle_flip_horizontal(self) -> bool:
+        """Toggle horizontal mirror flip on webcam frames."""
+        self._flip_horizontal = not self._flip_horizontal
+        self._remember_current_camera_settings()
+        return self._flip_horizontal
+
+    def toggle_flip_vertical(self) -> bool:
+        """Toggle vertical flip on webcam frames."""
+        self._flip_vertical = not self._flip_vertical
+        self._remember_current_camera_settings()
+        return self._flip_vertical
+
+    def apply_persistence_state(self, payload: dict[str, Any]) -> None:
+        """Apply persisted webcam state before startup."""
+        if not isinstance(payload, dict):
+            return
+        selected = payload.get('selected_camera')
+        if isinstance(selected, int):
+            self._device = int(selected)
+
+        disabled = payload.get('disabled_cameras', [])
+        if isinstance(disabled, list):
+            self._disabled_cameras = {int(item) for item in disabled if isinstance(item, int)}
+
+        per_camera = payload.get('per_camera', {})
+        camera_settings: dict[int, dict[str, float | bool]] = {}
+        if isinstance(per_camera, dict):
+            for key, value in per_camera.items():
+                if not isinstance(value, dict):
+                    continue
+                try:
+                    cam_id = int(key)
+                except Exception:
+                    continue
+                camera_settings[cam_id] = {
+                    'brightness': max(0.2, min(2.0, float(value.get('brightness', 1.0)))),
+                    'contrast': max(0.2, min(2.0, float(value.get('contrast', 1.0)))),
+                    'flip_horizontal': bool(value.get('flip_horizontal', True)),
+                    'flip_vertical': bool(value.get('flip_vertical', False)),
+                }
+        self._camera_settings = camera_settings
+
+        self._layout = str(payload.get('layout', self._layout))
+        if self._layout == 'hidden':
+            self._layout = 'hide'
+        if self._layout in self._KEYPAD_TO_LAYOUT:
+            self._layout = self._KEYPAD_TO_LAYOUT[self._layout]
+        if self._layout == 'hide':
+            self._hidden = True
+            self._layout = 'bottom_right'
+        elif self._layout != 'fullscreen' and self._layout not in self._LAYOUTS:
+            self._layout = 'bottom_right'
+
+        self._pip_scale = max(0.12, min(0.80, float(payload.get('pip_scale', self._pip_scale))))
+        treatment = str(payload.get('treatment', self.current_treatment)).lower()
+        if treatment in _TREATMENT_NAMES:
+            self._treatment_index = _TREATMENT_NAMES.index(treatment)
+        self._auto_cycle = bool(payload.get('auto_cycle', self._auto_cycle))
+
+        self._apply_camera_settings(int(self._device))
+        self._remember_current_camera_settings(int(self._device))
+
+    def get_persistence_state(self) -> dict[str, Any]:
+        """Return webcam settings payload for shared runtime persistence."""
+        self._remember_current_camera_settings()
+        selected_device = self._active_or_default_device()
+        return {
+            'selected_camera': int(selected_device),
+            'disabled_cameras': sorted(int(idx) for idx in self._disabled_cameras),
+            'layout': 'hide' if self._hidden else str(self._layout),
+            'pip_scale': float(self._pip_scale),
+            'treatment': str(self.current_treatment),
+            'auto_cycle': bool(self._auto_cycle),
+            'per_camera': {
+                str(cam_id): {
+                    'brightness': float(values.get('brightness', 1.0)),
+                    'contrast': float(values.get('contrast', 1.0)),
+                    'flip_horizontal': bool(values.get('flip_horizontal', True)),
+                    'flip_vertical': bool(values.get('flip_vertical', False)),
+                }
+                for cam_id, values in sorted(self._camera_settings.items(), key=lambda item: item[0])
+            },
+        }
+
+    def webcam_flip_state(self) -> dict[str, bool]:
+        """Return current webcam flip state for editor and control-room UI."""
+        return {
+            'horizontal': self._flip_horizontal,
+            'vertical': self._flip_vertical,
+        }
+
+    def webcam_image_state(self) -> dict[str, float | bool]:
+        """Return webcam image-control state for operator UIs."""
+        switching = bool(self._switch_hide_active and time.monotonic() < self._switch_hide_deadline)
+        remaining_s = max(0.0, self._switch_hide_deadline - time.monotonic()) if switching else 0.0
+        return {
+            'brightness': float(self._brightness),
+            'contrast': float(self._contrast),
+            'flip_horizontal': bool(self._flip_horizontal),
+            'flip_vertical': bool(self._flip_vertical),
+            'switching': switching,
+            'switch_hide_remaining_s': float(remaining_s),
+        }
+
+    def _restart_worker(self) -> None:
+        """Start capture worker if needed, or request in-thread device switch."""
+        if not self._available_cameras:
+            if self._worker is not None:
+                self._worker.stop()
+                self._worker.join(timeout=0.25)
+                self._worker = None
+            self._active_device = None
+            return
         device = (
             self._available_cameras[self._camera_list_index]
             if self._available_cameras
             else self._device
         )
-        self._worker = _CameraWorker(device, self._cam_width, self._cam_height, self._cam_fps)
-        self._worker.start()
+        self._active_device = int(device)
+        self._apply_camera_settings(self._active_device)
+        log.debug(
+            'WebcamSystem: apply camera selection idx=%d device=%d available=%s',
+            self._camera_list_index,
+            self._active_device,
+            self._available_cameras,
+        )
+        if self._worker is None or not self._worker.is_alive():
+            self._worker = _CameraWorker(device, self._cam_width, self._cam_height, self._cam_fps)
+            self._worker.start()
+            return
+        self._worker.request_device(device)
 
     def next_camera(self) -> str | None:
         """Switch to the next detected camera device. Returns a label or None if only one."""
         if len(self._available_cameras) <= 1:
             return None
+        self._prepare_camera_switch_hide()
         self._camera_list_index = (self._camera_list_index + 1) % len(self._available_cameras)
+        log.debug('WebcamSystem: next camera index -> %d', self._camera_list_index)
         self._restart_worker()
         dev = self._available_cameras[self._camera_list_index]
         return f'/dev/video{dev}' if sys.platform != 'win32' else str(dev)
@@ -583,7 +871,9 @@ class WebcamSystem:
         """Switch to the previous detected camera device. Returns a label or None if only one."""
         if len(self._available_cameras) <= 1:
             return None
+        self._prepare_camera_switch_hide()
         self._camera_list_index = (self._camera_list_index - 1) % len(self._available_cameras)
+        log.debug('WebcamSystem: prev camera index -> %d', self._camera_list_index)
         self._restart_worker()
         dev = self._available_cameras[self._camera_list_index]
         return f'/dev/video{dev}' if sys.platform != 'win32' else str(dev)
@@ -597,6 +887,9 @@ class WebcamSystem:
     # ------------------------------------------------------------------
 
     def render(self, dt: float, bass: float, treble: float) -> None:
+        if self._switch_hide_active and time.monotonic() >= self._switch_hide_deadline:
+            self._switch_hide_active = False
+            self._hidden = False
         if not self.enabled or self._hidden:
             return
 
@@ -648,6 +941,17 @@ class WebcamSystem:
         frame = self._worker.latest()
         if frame is None:
             return self._fallback_tex
+        if self._flip_horizontal and self._flip_vertical:
+            frame = np.ascontiguousarray(frame[::-1, ::-1, :])
+        elif self._flip_horizontal:
+            frame = np.ascontiguousarray(frame[:, ::-1, :])
+        elif self._flip_vertical:
+            frame = np.ascontiguousarray(frame[::-1, :, :])
+        if self._brightness != 1.0 or self._contrast != 1.0:
+            adjusted = frame.astype(np.float32) / 255.0
+            adjusted = (adjusted - 0.5) * self._contrast + 0.5
+            adjusted *= self._brightness
+            frame = np.clip(adjusted * 255.0, 0.0, 255.0).astype(np.uint8)
         h, w = frame.shape[:2]
         if self._cam_tex is None or self._cam_tex_size != (w, h):
             if self._cam_tex is not None:
