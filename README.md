@@ -69,6 +69,10 @@ While this effect is active, the standard keypad layout controls apply:
 | `KP 0`  | Fullscreen camera |
 | `KP .`  | Hide camera |
 
+## Planning
+
+- docs/planning.md
+
 ## Tags
 
 `webcam` · `overlay` · `camera` · `drop-in`
