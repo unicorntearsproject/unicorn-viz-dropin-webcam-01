@@ -94,4 +94,4 @@ hotkey architecture, and upcoming control-room API surfaces.
 - Use the multi-head docs and audits as implementation references:
   - `drop-ins/multi-head-01/docs/operations.md`
   - `drop-ins/multi-head-01/docs/troubleshooting.md`
-  - `audits/multi-head-2026-05-10.md`
+  - `docs/archive/legacy-root-audits/multi-head-2026-05-10.md`
