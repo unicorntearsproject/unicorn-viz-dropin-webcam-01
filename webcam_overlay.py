@@ -429,7 +429,18 @@ class WebcamSystem:
                        else self.scale_pip(0.05))
                 return f'Camera PiP: {val:.0%}' if val > 0 else 'Camera PiP not available'
 
-        # Numpad layout controls.
+        # PgUp / PgDown — switch camera device.
+        if sym == sdl2.SDLK_PAGEUP:
+            label = self._vj_api.goto_prev_camera() if self._vj_api else self.prev_camera()
+            return f'Camera device: {label}' if label else 'Camera: only one device'
+        if sym == sdl2.SDLK_PAGEDOWN:
+            label = self._vj_api.goto_next_camera() if self._vj_api else self.next_camera()
+            return f'Camera device: {label}' if label else 'Camera: only one device'
+
+        # Ctrl+Numpad — layout positions, treatment cycling, PiP, auto-cycle.
+        if not (mod & sdl2.KMOD_CTRL):
+            return False
+
         layout_map = {
             sdl2.SDLK_KP_1: '1', sdl2.SDLK_KP_2: '2', sdl2.SDLK_KP_3: '3',
             sdl2.SDLK_KP_4: '4', sdl2.SDLK_KP_5: '5', sdl2.SDLK_KP_6: '6',
@@ -461,16 +472,6 @@ class WebcamSystem:
                 self._hidden = True
                 success = True
             return 'Camera: hidden' if success else 'Camera: not available'
-
-        # Camera treatment cycling / PiP sizing (KP operator row).
-        if mod & sdl2.KMOD_CTRL:
-            if sym == sdl2.SDLK_KP_DIVIDE:
-                label = self._vj_api.goto_prev_camera() if self._vj_api else self.prev_camera()
-                return f'Camera device: {label}' if label else 'Camera: only one device'
-            if sym == sdl2.SDLK_KP_MULTIPLY:
-                label = self._vj_api.goto_next_camera() if self._vj_api else self.next_camera()
-                return f'Camera device: {label}' if label else 'Camera: only one device'
-
         if sym == sdl2.SDLK_KP_DIVIDE:
             name = self._vj_api.goto_prev_webcam_effect() if self._vj_api else self.prev_treatment()
             return f'Camera treatment: {name}' if name else 'Camera: not available'
