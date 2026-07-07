@@ -421,11 +421,19 @@ class WebcamSystem:
                 ('webcam_next_camera',  'Next camera device'),
                 ('webcam_prev_camera',  'Previous camera device'),
                 ('webcam_auto_cycle',   'Toggle webcam auto-cycle'),
+                ('webcam_next_effect',  'Next webcam effect'),
+                ('webcam_prev_effect',  'Prev webcam effect'),
+                ('webcam_flip_h',       'Flip webcam horizontal'),
+                ('webcam_flip_v',       'Flip webcam vertical'),
             ])
             api.register_midi_action_handler('webcam_toggle',      self._midi_toggle)
             api.register_midi_action_handler('webcam_next_camera', self._midi_next_camera)
             api.register_midi_action_handler('webcam_prev_camera', self._midi_prev_camera)
             api.register_midi_action_handler('webcam_auto_cycle',  self.toggle_auto_cycle)
+            api.register_midi_action_handler('webcam_next_effect', self._midi_next_effect)
+            api.register_midi_action_handler('webcam_prev_effect', self._midi_prev_effect)
+            api.register_midi_action_handler('webcam_flip_h',      self.toggle_flip_horizontal)
+            api.register_midi_action_handler('webcam_flip_v',      self.toggle_flip_vertical)
         except Exception as exc:
             import logging  # noqa: PLC0415
             logging.getLogger(__name__).debug('webcam-01: MIDI registration failed: %s', exc)
@@ -447,6 +455,16 @@ class WebcamSystem:
             self._vj_api.goto_prev_camera()
         else:
             self.prev_camera()
+
+    def _midi_next_effect(self) -> None:
+        """MIDI handler: advance to next webcam visual effect."""
+        if self._vj_api is not None:
+            self._vj_api.goto_next_webcam_effect()
+
+    def _midi_prev_effect(self) -> None:
+        """MIDI handler: retreat to previous webcam visual effect."""
+        if self._vj_api is not None:
+            self._vj_api.goto_prev_webcam_effect()
 
     def handle_key(self, sym: int, mod: int) -> 'str | None | bool':
         """Handle webcam numpad layout + Alt+[/] PiP sizing keys."""
