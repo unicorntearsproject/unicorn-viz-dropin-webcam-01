@@ -415,6 +415,38 @@ class WebcamSystem:
     def set_vj_api(self, api: Any) -> None:
         """Inject the VJApi instance after construction."""
         self._vj_api = api
+        try:
+            api.register_midi_actions('Webcam', [
+                ('webcam_toggle',       'Toggle webcam overlay'),
+                ('webcam_next_camera',  'Next camera device'),
+                ('webcam_prev_camera',  'Previous camera device'),
+                ('webcam_auto_cycle',   'Toggle webcam auto-cycle'),
+            ])
+            api.register_midi_action_handler('webcam_toggle',      self._midi_toggle)
+            api.register_midi_action_handler('webcam_next_camera', self._midi_next_camera)
+            api.register_midi_action_handler('webcam_prev_camera', self._midi_prev_camera)
+            api.register_midi_action_handler('webcam_auto_cycle',  self.toggle_auto_cycle)
+        except Exception as exc:
+            import logging  # noqa: PLC0415
+            logging.getLogger(__name__).debug('webcam-01: MIDI registration failed: %s', exc)
+
+    def _midi_toggle(self) -> None:
+        """MIDI handler: toggle webcam overlay on/off."""
+        self.enabled = not self.enabled
+
+    def _midi_next_camera(self) -> None:
+        """MIDI handler: advance to next camera device."""
+        if self._vj_api is not None:
+            self._vj_api.goto_next_camera()
+        else:
+            self.next_camera()
+
+    def _midi_prev_camera(self) -> None:
+        """MIDI handler: retreat to previous camera device."""
+        if self._vj_api is not None:
+            self._vj_api.goto_prev_camera()
+        else:
+            self.prev_camera()
 
     def handle_key(self, sym: int, mod: int) -> 'str | None | bool':
         """Handle webcam numpad layout + Alt+[/] PiP sizing keys."""
