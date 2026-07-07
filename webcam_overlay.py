@@ -5,16 +5,17 @@ Provides five visual treatments that cycle with KP-/ and KP-*.
 Does not appear in the main effect playlist.
 
 Keypad controls (active at all times regardless of which effect is running):
-    KP 0          Fullscreen camera
-    KP .          Hide camera
-    KP 1..9       PiP position (bottom-left .. top-right grid)
-    KP -          Shrink PiP
-    KP +          Grow PiP
-    KP /          Previous camera treatment
-    KP *          Next camera treatment
-    KP Enter      Toggle auto-cycle camera treatments
-    Ctrl+KP /     Previous camera device
-    Ctrl+KP *     Next camera device
+    Ctrl+KP 0     Fullscreen camera
+    Ctrl+KP .     Hide camera
+    Ctrl+KP 1..9  PiP position (bottom-left .. top-right grid)
+    Ctrl+KP -     Shrink PiP
+    Ctrl+KP +     Grow PiP
+    Ctrl+KP /     Previous camera treatment
+    Ctrl+KP *     Next camera treatment
+    Ctrl+KP Enter Toggle auto-cycle camera treatments
+    PageUp        Previous camera device
+    PageDown      Next camera device
+    Ctrl+Alt+K    Webcam editor modal (core-dispatched)
 
 Camera treatments:
     raw       Clean camera feed, minimal processing
@@ -306,12 +307,13 @@ class WebcamSystem:
     """Always-on camera overlay.  Not a playlist effect."""
 
     HELP_ENTRIES: list[tuple[str, str, str]] = [
-        ('Camera Overlay', 'KP 1-9', 'PiP position'),
-        ('Camera Overlay', 'KP 0 / .', 'PiP fullscreen / hide'),
-        ('Camera Overlay', 'KP / *', 'Treatment prev / next'),
-        ('Camera Overlay', 'KP - +', 'PiP size'),
-        ('Camera Overlay', 'KP Enter', 'Treatment auto-cycle'),
-        ('Camera Overlay', 'Ctrl+KP / *', 'Camera device prev / next'),
+        ('Camera Overlay', 'Ctrl+KP 1-9', 'PiP position'),
+        ('Camera Overlay', 'Ctrl+KP 0 / .', 'PiP fullscreen / hide'),
+        ('Camera Overlay', 'Ctrl+KP / *', 'Treatment prev / next'),
+        ('Camera Overlay', 'Ctrl+KP - +', 'PiP size'),
+        ('Camera Overlay', 'Ctrl+KP Enter', 'Treatment auto-cycle'),
+        ('Camera Overlay', 'PageUp / PageDown', 'Camera device prev / next'),
+        ('Camera Overlay', 'Ctrl+Alt+K', 'Webcam editor modal'),
     ]
 
     _LAYOUTS: dict[str, tuple[float, float]] = {
