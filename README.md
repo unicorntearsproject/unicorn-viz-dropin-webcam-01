@@ -1,5 +1,8 @@
 # webcam-01 — Webcam Overlay Effect
 
+**Version 1.0.0-rc.1**
+
+
 A drop-in effect for [unicorn-viz](https://github.com/iDoMeteor/unicorn-viz).
 
 ## Description
@@ -76,3 +79,7 @@ While this effect is active, the standard keypad layout controls apply:
 ## Tags
 
 `webcam` · `overlay` · `camera` · `drop-in`
+
+## Changelog
+
+- **1.0.0-rc.1** — initial versioned release.
