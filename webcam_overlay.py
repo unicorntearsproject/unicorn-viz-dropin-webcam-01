@@ -26,7 +26,7 @@ Camera treatments:
 """
 from __future__ import annotations
 
-__version__ = '1.0.0-rc.1'
+__version__ = '1.0.0-rc.2'
 
 import logging
 import sys
@@ -523,7 +523,7 @@ class WebcamSystem:
             if self._vj_api is not None:
                 success = self._vj_api.set_camera_layout('.')
             else:
-                self._hidden = True
+                self.set_layout('hide')
                 success = True
             return 'Camera: hidden' if success else 'Camera: not available'
         if sym == sdl2.SDLK_KP_DIVIDE:
@@ -550,6 +550,13 @@ class WebcamSystem:
         if not _CV2:
             log.error('WebcamSystem: opencv-python-headless not installed')
             return
+        # Privacy: never open (or even probe) the camera while the overlay is
+        # hidden — the shipped default is pip_position = "hidden", which used
+        # to light the webcam LED at first boot and capture at 30 fps into a
+        # frame nobody rendered. The worker starts lazily on first show.
+        if self._hidden:
+            log.info('WebcamSystem: started hidden — camera stays off until shown')
+            return
         self.rediscover_cameras()
         self._restart_worker()
         log.info('WebcamSystem: started (treatment=%s, layout=%s, cameras=%s)',
@@ -571,11 +578,35 @@ class WebcamSystem:
             token = self._KEYPAD_TO_LAYOUT[token]
         if token == 'hide':
             self._hidden = True
+            # Privacy: a deliberate hide releases the camera entirely (LED
+            # off), unlike the transient camera-switch shim which keeps the
+            # worker alive across a device change.
+            self._stop_worker()
             return 'hide'
         self._hidden = False
         if token == 'fullscreen' or token in self._LAYOUTS:
             self._layout = token
+        self._ensure_worker()
         return self._layout
+
+    def _stop_worker(self) -> None:
+        """Stop and release the capture worker (camera LED goes off)."""
+        if self._worker is not None:
+            try:
+                self._worker.stop()
+                self._worker.join(timeout=2.0)
+            except Exception:
+                pass
+            self._worker = None
+
+    def _ensure_worker(self) -> None:
+        """Lazily start capture on first show (no camera while hidden)."""
+        if self._hidden or not self.enabled or not _CV2:
+            return
+        if not self._available_cameras:
+            self.rediscover_cameras()
+        if self._worker is None or not self._worker.is_alive():
+            self._restart_worker()
 
     def _active_or_default_device(self) -> int:
         if self._active_device is not None:

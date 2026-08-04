@@ -1,6 +1,6 @@
 # webcam-01 — Webcam Overlay Effect
 
-**Version 1.0.0-rc.1**
+**Version 1.0.0-rc.2**
 
 
 A drop-in effect for [unicorn-viz](https://github.com/iDoMeteor/unicorn-viz).
@@ -82,4 +82,5 @@ While this effect is active, the standard keypad layout controls apply:
 
 ## Changelog
 
+- **1.0.0-rc.2** — privacy: the camera never opens (or probes) while the overlay is hidden — with the shipped `pip_position = "hidden"` default the webcam LED previously lit at first boot capturing 30 fps nobody rendered. Capture now starts lazily on first show, a deliberate hide releases the device, and the transient camera-switch shim still keeps it alive. 5 regression tests.
 - **1.0.0-rc.1** — initial versioned release.
