@@ -26,7 +26,7 @@ Camera treatments:
 """
 from __future__ import annotations
 
-__version__ = '1.0.0-rc.2'
+__version__ = '1.0.0-rc.3'
 
 import logging
 import sys
@@ -358,8 +358,15 @@ class WebcamSystem:
         self._switch_hide_active = False
         self._switch_hide_deadline = 0.0
         self._switch_hide_duration_s = max(0.0, float(cfg.get('switch_hide_duration_s', 1.2)))
-        # Route through set_layout so 'hidden' correctly sets self._hidden.
-        self.set_layout(str(cfg.get('pip_position', 'bottom_right')).lower())
+        # Resolve the configured position WITHOUT touching the capture
+        # worker: __init__ has not created it yet, and start() is the
+        # lifecycle method that opens the camera. Calling the full
+        # set_layout() here reached _ensure_worker() before _worker and
+        # _available_cameras existed, raising AttributeError out of the
+        # constructor -- which the core's guarded loader swallowed, silently
+        # disabling the whole drop-in (regression in 1.0.0-rc.2).
+        self._layout, self._hidden = self._resolve_layout_token(
+            str(cfg.get('pip_position', 'bottom_right')).lower(), self._layout)
 
         default_treatment = str(cfg.get('treatment', 'neon')).lower()
         if default_treatment not in _TREATMENT_NAMES:
@@ -570,22 +577,34 @@ class WebcamSystem:
     # Controls
     # ------------------------------------------------------------------
 
-    def set_layout(self, token: str) -> str:
+    def _resolve_layout_token(self, token: str,
+                              current: str) -> tuple[str, bool]:
+        """Map a layout token to ``(layout, hidden)``. Pure -- no side effects.
+
+        Split out so ``__init__`` can resolve the configured position
+        without starting capture; ``set_layout()`` adds the worker
+        lifecycle on top.
+        """
         token = token.lower().strip()
         if token == 'hidden':
             token = 'hide'
-        if token in self._KEYPAD_TO_LAYOUT:
-            token = self._KEYPAD_TO_LAYOUT[token]
+        token = self._KEYPAD_TO_LAYOUT.get(token, token)
         if token == 'hide':
-            self._hidden = True
+            return current, True
+        if token == 'fullscreen' or token in self._LAYOUTS:
+            return token, False
+        return current, False
+
+    def set_layout(self, token: str) -> str:
+        layout, hidden = self._resolve_layout_token(token, self._layout)
+        self._layout = layout
+        self._hidden = hidden
+        if hidden:
             # Privacy: a deliberate hide releases the camera entirely (LED
             # off), unlike the transient camera-switch shim which keeps the
             # worker alive across a device change.
             self._stop_worker()
             return 'hide'
-        self._hidden = False
-        if token == 'fullscreen' or token in self._LAYOUTS:
-            self._layout = token
         self._ensure_worker()
         return self._layout
 

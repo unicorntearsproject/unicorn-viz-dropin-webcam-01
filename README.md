@@ -1,6 +1,6 @@
 # webcam-01 — Webcam Overlay Effect
 
-**Version 1.0.0-rc.2**
+**Version 1.0.0-rc.3**
 
 
 A drop-in effect for [unicorn-viz](https://github.com/iDoMeteor/unicorn-viz).
@@ -82,5 +82,6 @@ While this effect is active, the standard keypad layout controls apply:
 
 ## Changelog
 
+- **1.0.0-rc.3** — **Fixes a total-failure regression introduced in rc.2.** The privacy change routed `__init__` through the side-effecting `set_layout()`, which now calls `_ensure_worker()` — reaching `_worker`/`_available_cameras` before either existed. The `AttributeError` escaped the constructor, core's guarded loader swallowed it, and the entire webcam drop-in was silently disabled for the session. `__init__` now resolves the configured position through a pure `_resolve_layout_token()` with no side effects; `start()` remains the only thing that opens a camera. Two new tests actually **construct** the object across every position value — every previous test built it with `__new__` and hand-set attributes, which is precisely why a construction-order bug could ship unnoticed.
 - **1.0.0-rc.2** — privacy: the camera never opens (or probes) while the overlay is hidden — with the shipped `pip_position = "hidden"` default the webcam LED previously lit at first boot capturing 30 fps nobody rendered. Capture now starts lazily on first show, a deliberate hide releases the device, and the transient camera-switch shim still keeps it alive. 5 regression tests.
 - **1.0.0-rc.1** — initial versioned release.
