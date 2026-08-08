@@ -26,7 +26,7 @@ Camera treatments:
 """
 from __future__ import annotations
 
-__version__ = '1.0.0-rc.3'
+__version__ = '1.0.0-rc.4'
 
 import logging
 import sys
@@ -185,6 +185,11 @@ class _CameraWorker(threading.Thread):
         self._switch_event = threading.Event()
         self._requested_device = int(device)
         self._latest: np.ndarray | None = None
+        # Bumped on every captured frame. Lets the render thread ask "is
+        # there anything new?" without paying for a copy of a frame it has
+        # already uploaded -- the camera runs at ~30 fps while the display
+        # attempts 60, so most render frames have nothing new to show.
+        self._seq: int = 0
         self._active = False
 
     def _try_open(self, dev: int):
@@ -267,6 +272,7 @@ class _CameraWorker(threading.Thread):
                     frame = cv2.flip(frame, 1)
                     with self._lock:
                         self._latest = frame
+                        self._seq += 1
                     fail_count = 0
                 else:
                     fail_count += 1
@@ -290,11 +296,29 @@ class _CameraWorker(threading.Thread):
         log.debug('WebcamSystem: switch requested -> camera %d', int(device))
         self._switch_event.set()
 
+    @property
+    def sequence(self) -> int:
+        """Monotonic count of captured frames; compare to skip stale work."""
+        with self._lock:
+            return self._seq
+
     def latest(self) -> np.ndarray | None:
         with self._lock:
             if self._latest is None:
                 return None
             return self._latest.copy()
+
+    def latest_if_newer(self, seen_seq: int) -> tuple[np.ndarray | None, int]:
+        """Return ``(frame, seq)`` only when ``seq`` has moved past *seen_seq*.
+
+        Returns ``(None, seen_seq)`` when nothing new has arrived, so the
+        caller can skip the copy, the ``tobytes()`` and the GPU upload
+        entirely. One lock acquisition either way.
+        """
+        with self._lock:
+            if self._latest is None or self._seq == seen_seq:
+                return None, self._seq
+            return self._latest.copy(), self._seq
 
     @property
     def active(self) -> bool:
@@ -417,6 +441,8 @@ class WebcamSystem:
 
         self._cam_tex: moderngl.Texture | None = None
         self._cam_tex_size = (0, 0)
+        # Capture sequence already uploaded; -1 forces the first upload.
+        self._cam_seq: int = -1
         self._worker: _CameraWorker | None = None
         self._time = 0.0
         self._vj_api: Any = None
@@ -607,6 +633,10 @@ class WebcamSystem:
             return 'hide'
         self._ensure_worker()
         return self._layout
+
+    def _invalidate_camera_frame(self) -> None:
+        """Force the next render to re-upload (device switch / restart)."""
+        self._cam_seq = -1
 
     def _stop_worker(self) -> None:
         """Stop and release the capture worker (camera LED goes off)."""
@@ -935,6 +965,10 @@ class WebcamSystem:
 
     def _restart_worker(self) -> None:
         """Start capture worker if needed, or request in-thread device switch."""
+        # A new/!switched worker restarts its own sequence, so drop the
+        # cached one or the first frames of the new camera would be skipped
+        # as "already uploaded".
+        self._invalidate_camera_frame()
         if not self._available_cameras:
             if self._worker is not None:
                 self._worker.stop()
@@ -1041,11 +1075,27 @@ class WebcamSystem:
     # ------------------------------------------------------------------
 
     def _get_camera_texture(self) -> moderngl.Texture:
+        """Return the camera texture, re-uploading only on a NEW frame.
+
+        This used to copy the frame, convert it with ``tobytes()`` and push
+        it to the GPU on *every rendered frame* — three full passes over
+        1280x720x3 at up to 60 fps to display a picture the 30 fps camera
+        had not changed, roughly 490 MB/s of pointless memory traffic. It
+        fitted the budget alone, but not alongside a 4K mirror composite,
+        which is exactly the "webcam + mirror together" fault the owner
+        isolated (2026-08-08 capture: subsys_upd median 21 ms, the largest
+        single stage). Now the whole path short-circuits when the capture
+        sequence has not advanced, and the flip/brightness/contrast work —
+        which allocated a float32 copy of the entire frame — rides along
+        only on frames that are actually new.
+        """
         if self._worker is None:
             return self._fallback_tex
-        frame = self._worker.latest()
+        frame, seq = self._worker.latest_if_newer(self._cam_seq)
         if frame is None:
-            return self._fallback_tex
+            # Nothing new: reuse the texture already on the GPU.
+            return self._cam_tex if self._cam_tex is not None else self._fallback_tex
+        self._cam_seq = seq
         if self._flip_horizontal and self._flip_vertical:
             frame = np.ascontiguousarray(frame[::-1, ::-1, :])
         elif self._flip_horizontal:

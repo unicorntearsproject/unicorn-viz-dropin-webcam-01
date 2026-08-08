@@ -141,3 +141,98 @@ def test_constructor_does_not_start_capture(monkeypatch) -> None:
         lambda self: started.append(1))
     wo.WebcamSystem(_FakeCtx(), 1920, 1080, {'pip_position': 'bottom_right'})
     assert started == []
+
+
+# ------------------------------------------------- redundant-upload fix (rc.4)
+
+class _SeqWorker:
+    """Capture worker stand-in with the real sequence semantics."""
+
+    def __init__(self) -> None:
+        import numpy as _np
+        self._frame = _np.zeros((4, 4, 3), dtype=_np.uint8)
+        self._seq = 0
+
+    def bump(self) -> None:
+        self._seq += 1
+
+    @property
+    def sequence(self) -> int:
+        return self._seq
+
+    def latest_if_newer(self, seen):
+        if self._seq == seen:
+            return None, self._seq
+        return self._frame.copy(), self._seq
+
+    def is_alive(self) -> bool:
+        return True
+
+
+def _system_with_worker():
+    s = wo.WebcamSystem.__new__(wo.WebcamSystem)
+    s._worker = _SeqWorker()
+    s._cam_seq = -1
+    s._cam_tex = None
+    s._cam_tex_size = (0, 0)
+    s._fallback_tex = object()
+    s._flip_horizontal = s._flip_vertical = False
+    s._brightness = s._contrast = 1.0
+    return s
+
+
+def test_unchanged_frame_skips_the_upload_entirely() -> None:
+    """The 2026-08-08 fault: the camera runs ~30fps while the display
+    attempts 60, so most rendered frames re-uploaded a byte-identical
+    frame — ~490 MB/s of memory traffic that only fell over once the 4K
+    mirror composite was competing for the same bus."""
+    uploaded: list[int] = []
+
+    class _Tex:
+        size = (4, 4)
+        def write(self, _data): uploaded.append(1)
+        def release(self): pass
+
+    s = _system_with_worker()
+    s._cam_tex = _Tex()
+    s._cam_tex_size = (4, 4)
+
+    s._worker.bump()                       # one new camera frame
+    wo.WebcamSystem._get_camera_texture(s)
+    assert uploaded == [1]
+
+    for _ in range(10):                    # ten renders, no new camera frame
+        wo.WebcamSystem._get_camera_texture(s)
+    assert uploaded == [1], 'must not re-upload an unchanged frame'
+
+    s._worker.bump()                       # next camera frame arrives
+    wo.WebcamSystem._get_camera_texture(s)
+    assert uploaded == [1, 1]
+
+
+def test_stale_frame_returns_the_existing_texture_not_the_fallback() -> None:
+    """Skipping the upload must keep showing the camera, not flash the
+    placeholder."""
+    class _Tex:
+        size = (4, 4)
+        def write(self, _data): pass
+        def release(self): pass
+
+    s = _system_with_worker()
+    tex = _Tex()
+    s._cam_tex = tex
+    s._cam_tex_size = (4, 4)
+    s._cam_seq = 0                          # already current
+    assert wo.WebcamSystem._get_camera_texture(s) is tex
+
+
+def test_worker_restart_forces_a_fresh_upload() -> None:
+    """A new worker restarts its own sequence, so the cached one must be
+    dropped or the new camera's first frames look 'already uploaded'."""
+    s = wo.WebcamSystem.__new__(wo.WebcamSystem)
+    s._cam_seq = 47
+    s._available_cameras = []
+    s._worker = None
+    s._active_device = None
+    wo.WebcamSystem._restart_worker(s)
+    assert s._cam_seq == -1

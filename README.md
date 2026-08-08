@@ -1,6 +1,6 @@
 # webcam-01 — Webcam Overlay Effect
 
-**Version 1.0.0-rc.3**
+**Version 1.0.0-rc.4**
 
 
 A drop-in effect for [unicorn-viz](https://github.com/iDoMeteor/unicorn-viz).
@@ -82,6 +82,17 @@ While this effect is active, the standard keypad layout controls apply:
 
 ## Changelog
 
+- **1.0.0-rc.4** — **Stops re-uploading a frame the camera never changed.**
+  The render path copied the frame, ran `tobytes()` and pushed it to the GPU
+  on *every rendered frame* — three full passes over 1280x720x3 at up to
+  60 fps to show a picture the 30 fps camera had not touched, roughly
+  490 MB/s of pointless memory traffic. Alone it fit the budget; alongside a
+  4K mirror composite it did not, which is exactly the "webcam + mirror
+  together" fault the owner isolated (measured: `subsys_upd` was the single
+  largest frame stage at 21 ms median, more than `draw`). The capture worker
+  now stamps a sequence number and the whole path — copy, flip,
+  brightness/contrast float32 conversion, upload — short-circuits when
+  nothing new has arrived. 3 regression tests.
 - **1.0.0-rc.3** — **Fixes a total-failure regression introduced in rc.2.** The privacy change routed `__init__` through the side-effecting `set_layout()`, which now calls `_ensure_worker()` — reaching `_worker`/`_available_cameras` before either existed. The `AttributeError` escaped the constructor, core's guarded loader swallowed it, and the entire webcam drop-in was silently disabled for the session. `__init__` now resolves the configured position through a pure `_resolve_layout_token()` with no side effects; `start()` remains the only thing that opens a camera. Two new tests actually **construct** the object across every position value — every previous test built it with `__new__` and hand-set attributes, which is precisely why a construction-order bug could ship unnoticed.
 - **1.0.0-rc.2** — privacy: the camera never opens (or probes) while the overlay is hidden — with the shipped `pip_position = "hidden"` default the webcam LED previously lit at first boot capturing 30 fps nobody rendered. Capture now starts lazily on first show, a deliberate hide releases the device, and the transient camera-switch shim still keeps it alive. 5 regression tests.
 - **1.0.0-rc.1** — initial versioned release.
