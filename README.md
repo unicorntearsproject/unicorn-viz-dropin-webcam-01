@@ -1,40 +1,89 @@
-# webcam-01 — Webcam Overlay Effect
+# webcam-01 — Webcam Overlay
 
 **Version 1.1.0**
 
-> **Doc staleness note (2026-08-09):** this README's Description/Hotkeys
-> sections below describe an older `WebcamOverlay` playlist-effect
-> architecture and reference `unicornviz/camera_overlay.py`, neither of
-> which exist in the current code. The actual current implementation is
-> `WebcamSystem` in `webcam_overlay.py` — the always-on system-level PiP
-> overlay described in that file's own module docstring. Pre-existing
-> staleness, not introduced by this change; flagging rather than doing an
-> unscoped rewrite. The two sections below ("Auto-cycle timing" and
-> "Selfie-segmentation background dim") describe the current code
-> accurately.
-
-
-A drop-in effect for [unicorn-viz](https://github.com/iDoMeteor/unicorn-viz).
+A drop-in for [unicorn-viz](https://github.com/iDoMeteor/unicorn-viz).
 
 ## Description
 
-A standalone playlist effect that places the live camera feed over an animated, audio-reactive background. Selected from the playlist like any other effect.
+An always-on, system-level picture-in-picture camera overlay, implemented
+by `WebcamSystem` in `webcam_overlay.py`. It renders above whatever main
+effect is currently active and below the HUD — it is **not** a playlist
+effect and does not appear in the effect playlist. It starts automatically
+whenever `[webcam] enabled = true` (the default) and is controlled at any
+time via the keypad, regardless of which effect is showing.
 
-> **Note:** This is separate from the *system-level camera overlay* (`unicornviz/camera_overlay.py`) which renders a PiP over every effect regardless of which is active. This drop-in is a full-screen effect with its own animated background.
+The camera feed can be shown as a corner/edge/center picture-in-picture
+(nine grid positions), fullscreen, or hidden entirely — hiding fully
+releases the camera device (LED off) rather than just not drawing it, and
+the camera never opens at all if the configured startup position is
+`hidden`.
 
-## Visual Features
+## Visual treatments
 
-- Animated neon-grid background driven by bass and treble
-- Camera feed rendered as a PiP or fullscreen overlay
-- Cyan border that pulses with bass
-- Keypad-controlled PiP position (9 presets + fullscreen + hide)
+Five shaders the live feed can be rendered through, cycled with
+`Ctrl+KP /` and `Ctrl+KP *` (see `_TREATMENT_FRAGS` / `_TREATMENT_NAMES`
+in `webcam_overlay.py`):
 
-## Audio Reactivity
+| Treatment | What it does |
+|---|---|
+| `raw`     | Clean feed, no processing |
+| `neon`    | Bass-reactive exposure punch + scanline modulation, slight blue push |
+| `glitch`  | Bass/treble-driven chromatic aberration and beat-triggered scanline scramble |
+| `vintage` | Sepia tone, vignette, animated film grain, bass-reactive red push |
+| `thermal` | Luminance mapped through a false-colour heat palette, bass-boosted |
 
-| Signal  | Effect |
-|---------|--------|
-| `bass`  | Background wave intensity, border glow |
-| `treble`| Background colour temperature |
+The default treatment is `neon` (or `[webcam] treatment`, if set).
+
+### Auto-cycle
+
+`Ctrl+KP Enter` toggles auto-cycle, which alternates the plain feed
+(`raw`) with the next treatment rather than round-robining flatly through
+every treatment including raw:
+
+```text
+normal -> effect1 -> normal -> effect2 -> normal -> effect3 -> ...
+```
+
+An effect airs for half of `[webcam] cycle_interval`; the normal
+interlude between effects airs for the full (un-halved) `cycle_interval`,
+so effects read as brief highlights rather than eating equal screen time
+to plain video. Manual treatment switching (`Ctrl+KP /`, `Ctrl+KP *`) is
+unaffected — it still cycles flatly through every treatment, raw
+included.
+
+### Selfie-segmentation background dim
+
+Optional, per-camera, off by default. Runs MediaPipe's selfie-segmentation
+model on the capture thread (never the render thread — inference costs
+~8–15 ms, too much of the 16.67 ms frame budget to spend there) and dims
+every background pixel to 25% of its original brightness, leaving the
+detected person untouched. Applied *before* every treatment shader, so
+raw/neon/glitch/vintage/thermal all receive an already-dimmed background
+for free.
+
+Requires `mediapipe` (see `requirements.txt` — needs `--no-deps` to avoid
+a conflict with this project's pinned `opencv-python-headless`) and the
+bundled model at `assets/models/selfie_segmenter.tflite` (Apache 2.0 —
+see `assets/models/NOTICE.md` for provenance/attribution). Absent either,
+the toggle silently does nothing rather than erroring.
+
+Toggle per-camera from the Config Editor's **Visuals** tab — one 0/1
+slider per detected camera (the generic Config Editor has no native
+checkbox widget, so booleans ride a min=0/max=1 slider by the same
+convention used elsewhere in the app). Not configurable from
+`config.toml` directly, since it's inherently per-camera rather than a
+single scalar.
+
+## Audio reactivity
+
+Only `raw` is silent. Every other treatment reads `iBass`; `glitch` is
+the only one that also reads `iTreble`.
+
+| Signal | Effect |
+|---|---|
+| `bass` (`iBass`) | `neon`: exposure punch + faint blue push. `glitch`: chromatic-aberration spread + probability/magnitude of the beat-triggered scanline scramble. `vintage`: red-channel push. `thermal`: luminance boost before the heat-palette lookup. Also drives the PiP border's glow/thickness pulse in `render()`, independent of treatment. |
+| `treble` (`iTreble`) | `glitch` only: adds to the chromatic-aberration spread. |
 
 ## Requirements
 
@@ -43,6 +92,13 @@ opencv-python-headless >= 4.9
 ```
 
 Already listed in the main `requirements.txt`.
+
+Optional (selfie-segmentation only, not auto-installed — see
+`requirements.txt` in this directory for the install command):
+
+```
+mediapipe==1.0.0
+```
 
 ## Installer
 
@@ -57,69 +113,49 @@ by default. Use `--uninstall` to remove that bundle again.
 
 ## Config
 
+`[webcam]` in `config.toml` (see the section's own comments there for the
+live, authoritative defaults — this is a summary, not a second source of
+truth):
+
 ```toml
-[effects.WebcamOverlay]
-camera_device   = 0              # /dev/video index (Linux) or DirectShow (Windows)
-camera_width    = 1280
-camera_height   = 720
-camera_fps      = 30
-pip_position    = "bottom_right" # top_left | top_center | top_right |
-                                 # left | center | right |
-                                 # bottom_left | bottom_center | bottom_right |
-                                 # fullscreen
-pip_scale       = 0.33           # fraction of viewport width (0.12–0.80)
-border_thickness = 8.0            # border/backplate thickness in pixels
-border_color     = [0.04, 0.72, 1.0, 0.28]  # RGBA values 0.0–1.0
-enabled         = true           # false disables camera worker
+[webcam]
+device            = 0              # /dev/video index (Linux) or DirectShow index (Windows)
+width             = 1280
+height            = 720
+fps               = 30
+pip_position      = "bottom_right" # top_left | top_center | top_right |
+                                    # left | center | right |
+                                    # bottom_left | bottom_center | bottom_right |
+                                    # fullscreen | hidden
+pip_scale         = 0.33           # fraction of viewport width (0.12-0.80)
+border_thickness  = 8.0            # border/backplate thickness in pixels
+border_color      = [0.04, 0.72, 1.0, 0.28]  # RGBA, 0.0-1.0
+treatment         = "neon"         # raw | neon | glitch | vintage | thermal
+cycle_interval    = 30             # seconds; see Auto-cycle above
+brightness        = 1.0            # software multiplier, 0.2-2.0
+contrast          = 1.0            # software multiplier, 0.2-2.0
+flip_horizontal   = true           # mirror by default
+flip_vertical     = false
+switch_hide_duration_s = 1.2       # PiP hidden briefly during a device switch
+enabled           = true           # false disables the whole overlay + camera worker
+# selfie_seg is per-camera, not a single scalar here -- see Config Editor
+# Visuals tab, above.
 ```
+
+`pip_position = "hidden"` is the shipped default — the camera device is
+never opened (or even probed) until the overlay is shown for the first
+time; see the Description above.
 
 ## Hotkeys
 
-While this effect is active, the standard keypad layout controls apply:
-
-| Key     | Action |
-|---------|--------|
-| `KP 1–9`| PiP position |
-| `KP 0`  | Fullscreen camera |
-| `KP .`  | Hide camera |
-
-## Auto-cycle timing (current, accurate)
-
-`Ctrl+KP Enter` toggles auto-cycle. It alternates the plain camera feed
-(`raw`) with the next treatment, rather than round-robining flatly through
-every treatment including raw:
-
-```text
-normal -> effect1 -> normal -> effect2 -> normal -> effect3 -> ...
-```
-
-An effect airs for half of `[webcam] cycle_interval`; the normal interlude
-between effects airs for the full (un-halved) `cycle_interval`, so effects
-read as brief highlights rather than eating equal screen time to plain
-video. Manual treatment switching (`Ctrl+KP /`, `Ctrl+KP *`) is unaffected
-— it still cycles flatly through every treatment, raw included.
-
-## Selfie-segmentation background dim (current, accurate)
-
-Optional, per-camera, off by default. Runs MediaPipe's selfie-segmentation
-model on the capture thread (never the render thread — inference costs
-~8-15ms, too much of the 16.67ms frame budget to spend there) and dims
-every background pixel to 25% of its original brightness, leaving the
-detected person untouched. Applied *before* every treatment shader, so
-raw/neon/glitch/vintage/thermal all receive an already-dimmed background
-for free.
-
-Requires `mediapipe` (see `requirements.txt` — needs `--no-deps` to avoid
-a conflict with this project's pinned `opencv-python-headless`) and the
-bundled model at `assets/models/selfie_segmenter.tflite`. Absent either,
-the toggle silently does nothing rather than erroring.
-
-Toggle per-camera from the Config Editor's **Visuals** tab — one 0/1
-slider per detected camera (the generic Config Editor has no native
-checkbox widget, so booleans ride a min=0/max=1 slider by the same
-convention used elsewhere in the app). Not configurable from
-`config.toml` directly, since it's inherently per-camera rather than a
-single scalar.
+Keypad, PageUp/PageDown, and `Ctrl+Alt+K` controls are active at all
+times, independent of which effect is on screen. The full, current list
+lives in code as the project's single source of truth for keybindings
+(see CLAUDE.md's Drop-In policy) rather than being duplicated here where
+it can drift stale again: `HELP_ENTRIES` and the module docstring at the
+top of `webcam_overlay.py`, both merged automatically into the in-app `H`
+help overlay. `Alt+[` / `Alt+]` also resize the PiP as an alias for
+`Ctrl+KP -` / `Ctrl+KP +`.
 
 ## Planning
 
