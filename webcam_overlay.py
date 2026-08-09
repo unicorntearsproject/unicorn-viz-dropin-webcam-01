@@ -40,7 +40,7 @@ per detected camera), not from config.toml.
 """
 from __future__ import annotations
 
-__version__ = '1.1.0'
+__version__ = '1.1.1'
 
 import logging
 import sys
@@ -1067,8 +1067,17 @@ class WebcamSystem:
     _SELFIE_SEG_SETTING_SUFFIX = '_selfie_seg'
 
     def config_editor_settings(self) -> list[dict[str, float | str]]:
+        # Union _available_cameras with anything already known in memory
+        # (persisted per-camera settings, the configured default device) --
+        # NOT a fresh probe. The shipped default is pip_position = "hidden",
+        # under which start() deliberately never calls rediscover_cameras()
+        # (camera privacy: no probing while hidden), so _available_cameras
+        # alone stays empty and this tab would otherwise show zero rows
+        # until the operator manually shows the camera once.
+        devices = set(self._available_cameras) | set(self._camera_settings.keys())
+        devices.add(self._active_or_default_device())
         settings: list[dict[str, float | str]] = []
-        for dev in self._available_cameras:
+        for dev in sorted(devices):
             enabled = bool(self._camera_settings.get(dev, {}).get('selfie_seg', False))
             settings.append({
                 'name': f'{self._SELFIE_SEG_SETTING_PREFIX}{dev}{self._SELFIE_SEG_SETTING_SUFFIX}',

@@ -48,6 +48,35 @@ def test_selfie_seg_defaults_off() -> None:
     ]
 
 
+def test_config_editor_settings_shows_default_device_when_hidden_at_startup() -> None:
+    """pip_position = 'hidden' (the shipped default) means start() never
+    calls rediscover_cameras() (camera privacy: no probing while hidden),
+    so _available_cameras stays empty until the operator manually shows
+    the camera once. The Visuals tab must still offer a toggle for the
+    configured device, or there's no way to pre-set selfie-seg before
+    first show."""
+    s = _system()
+    s._available_cameras = []
+    s._active_device = None
+    s._device = 0
+    assert s.config_editor_settings() == [
+        {'name': 'cam0_selfie_seg', 'value': 0.0, 'min': 0.0, 'max': 1.0},
+    ]
+
+
+def test_config_editor_settings_includes_persisted_cameras_not_currently_detected() -> None:
+    s = _system()
+    s._available_cameras = []
+    s._active_device = None
+    s._device = 0
+    s._camera_settings = {2: {'selfie_seg': True}}
+    result = s.config_editor_settings()
+    assert result == [
+        {'name': 'cam0_selfie_seg', 'value': 0.0, 'min': 0.0, 'max': 1.0},
+        {'name': 'cam2_selfie_seg', 'value': 1.0, 'min': 0.0, 'max': 1.0},
+    ]
+
+
 def test_set_camera_selfie_seg_updates_persisted_setting() -> None:
     s = _system()
     s.set_camera_selfie_seg(2, True)

@@ -1,6 +1,6 @@
 # webcam-01 — Webcam Overlay
 
-**Version 1.1.0**
+**Version 1.1.1**
 
 A drop-in for [unicorn-viz](https://github.com/iDoMeteor/unicorn-viz).
 
@@ -167,6 +167,14 @@ help overlay. `Alt+[` / `Alt+]` also resize the PiP as an alias for
 
 ## Changelog
 
+- **1.1.1** — Fixes the Config Editor's Visuals tab showing zero
+  selfie-seg rows to toggle. `config_editor_settings()` only iterated
+  `_available_cameras`, which stays empty until the camera has been
+  shown at least once — `start()` deliberately skips `rediscover_cameras()`
+  while `pip_position = "hidden"` (the shipped default), for camera
+  privacy. Now unions in the configured/active device id and any
+  persisted per-camera settings, without probing hardware. 2 regression
+  tests.
 - **1.1.0** — Two additions:
   1. Auto-cycle (`Ctrl+KP Enter`) now alternates normal (raw) and the next
      treatment instead of round-robining flatly through every treatment
