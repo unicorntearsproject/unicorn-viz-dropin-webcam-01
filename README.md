@@ -1,6 +1,6 @@
 # webcam-01 — Webcam Overlay
 
-**Version 1.3.0**
+**Version 1.4.0**
 
 A drop-in for [unicorn-viz](https://github.com/iDoMeteor/unicorn-viz).
 
@@ -77,7 +77,12 @@ same grow-then-feather technique you'd use selecting a background in an
 image editor — grow the selection a couple px, feather, then cut:
 binarize, dilate the kept region (past stray fringe pixels like hair),
 then Gaussian-blur the edge so it reads as a smooth ramp instead of a
-sticker cutout (`_feather_mask()`).
+sticker cutout (`_feather_mask()`). Before that, the raw per-frame
+confidence mask is blended toward the *previous* frame's raw mask
+(`selfie_seg_temporal`) — MediaPipe has no notion of "last frame", so
+movement makes the raw mask noisy at the boundary frame to frame, which
+reads as a shaky/flickery edge. Blending smooths the boundary's actual
+position, not just the already-feathered alpha values.
 
 `transparent` needs real GPU alpha blending to look right, not just an
 RGBA texture: the border/backplate clear (`_clear_border_ring()`) only
@@ -104,6 +109,7 @@ way, rather than needing to be re-tuned per camera):
 | `selfie_seg_grow_px` | How far the kept (foreground) region grows past its original edge, in px | 3 | 0–20 |
 | `selfie_seg_feather_px` | Gaussian-blur radius applied to the grown edge, in px | 4 | 0–30 |
 | `selfie_seg_blur_px` | Gaussian-blur radius applied to the whole background in `blur` mode, in px | 35 | 0–100 |
+| `selfie_seg_temporal` | How much of the previous frame's raw mask carries forward — higher is smoother but laggier | 0.5 | 0–0.95 |
 
 None of this is configurable from `config.toml` directly — mode is
 inherently per-camera, and the tuning sliders are meant for live
@@ -201,6 +207,16 @@ help overlay. `Alt+[` / `Alt+]` also resize the PiP as an alias for
 
 ## Changelog
 
+- **1.4.0** — Temporal smoothing for the selfie-seg matte: the raw
+  per-frame confidence mask now blends toward the previous frame's raw
+  mask (`selfie_seg_temporal`, default 0.5, new global live slider)
+  before grow+feather runs, so the cutout boundary doesn't visibly
+  flicker/shake during movement (MediaPipe scores every frame from
+  scratch with no memory of the last one). `_CameraWorker` carries
+  `_prev_raw_mask` across frames; a resolution change (fresh worker
+  instance, or a mismatched cached shape) just starts smoothing over.
+  6 new regression tests (prev-mask bookkeeping, shape-mismatch safety,
+  a direct instant-vs-smoothed comparison), 52 total in this drop-in.
 - **1.3.0** — Selfie-seg gains a `blur` mode (background gets a strong
   Gaussian blur instead of dimming; default radius 35px — "DEF huge",
   per the owner) between `dim` and `transparent`. The `transparent`

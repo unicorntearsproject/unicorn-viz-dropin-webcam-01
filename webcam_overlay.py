@@ -50,13 +50,18 @@ binarize, dilate the kept region by `grow_px` to push the edge past stray
 fringe pixels, then Gaussian-blur by `feather_px` so the now-hard edge
 reads as a smooth ramp instead of a sticker cutout. `blur` additionally
 Gaussian-blurs the whole background by `blur_px` instead of dimming it.
-All three radii are global (not per-camera) live sliders on the Config
+Before any of that, the raw per-frame confidence mask is blended toward
+the *previous* frame's raw mask by `temporal` (the model has no notion of
+"last frame", so movement makes the boundary noisy frame to frame without
+this) -- smooths the boundary position itself, not just the final alpha.
+All four values are global (not per-camera) live sliders on the Config
 Editor's Visuals tab, defaulting to `_SELFIE_SEG_GROW_PX_DEFAULT` /
-`_SELFIE_SEG_FEATHER_PX_DEFAULT` / `_SELFIE_SEG_BLUR_PX_DEFAULT`.
+`_SELFIE_SEG_FEATHER_PX_DEFAULT` / `_SELFIE_SEG_BLUR_PX_DEFAULT` /
+`_SELFIE_SEG_TEMPORAL_DEFAULT`.
 """
 from __future__ import annotations
 
-__version__ = '1.3.0'
+__version__ = '1.4.0'
 
 import logging
 import sys
@@ -100,12 +105,21 @@ _SELFIE_SEG_MODEL_PATH = Path(__file__).resolve().parent / 'assets' / 'models' /
 _SELFIE_SEG_BG_DIM = 0.25
 # Grow-then-feather matte parameters (image-editor "select background,
 # grow selection a couple px, feather, cut" technique) and the 'blur'
-# mode's Gaussian radius. These are defaults only -- all three are
+# mode's Gaussian radius. These are defaults only -- all four are
 # tunable live from the Config Editor's Visuals tab (global, not
 # per-camera; see WebcamSystem._selfie_seg_grow_px and friends).
 _SELFIE_SEG_GROW_PX_DEFAULT = 3
 _SELFIE_SEG_FEATHER_PX_DEFAULT = 4
 _SELFIE_SEG_BLUR_PX_DEFAULT = 35  # "DEF huge" -- a strong blur out of the box
+# Temporal smoothing: how much of the *previous* frame's raw confidence
+# mask carries into this frame's blend, in [0, 1) -- 0 disables it
+# entirely (each frame stands alone), higher values trade responsiveness
+# for stability. Movement makes the raw per-frame mask noisy at the
+# boundary (the model has no notion of the previous frame), which reads
+# as a shaky/flickery edge; blending toward the prior mask before the
+# grow+feather pass smooths the *boundary position* itself, not just the
+# already-feathered alpha.
+_SELFIE_SEG_TEMPORAL_DEFAULT = 0.5
 _SELFIE_SEG_MODES: tuple[str, ...] = ('off', 'dim', 'blur', 'transparent')
 
 log = logging.getLogger(__name__)
@@ -275,6 +289,7 @@ class _CameraWorker(threading.Thread):
         selfie_seg_grow_px: int = _SELFIE_SEG_GROW_PX_DEFAULT,
         selfie_seg_feather_px: int = _SELFIE_SEG_FEATHER_PX_DEFAULT,
         selfie_seg_blur_px: int = _SELFIE_SEG_BLUR_PX_DEFAULT,
+        selfie_seg_temporal: float = _SELFIE_SEG_TEMPORAL_DEFAULT,
     ) -> None:
         super().__init__(daemon=True, name='webcam-capture')
         self._device = int(device)
@@ -297,6 +312,13 @@ class _CameraWorker(threading.Thread):
         self._selfie_seg_grow_px = max(0, int(selfie_seg_grow_px))
         self._selfie_seg_feather_px = max(0, int(selfie_seg_feather_px))
         self._selfie_seg_blur_px = max(0, int(selfie_seg_blur_px))
+        self._selfie_seg_temporal = max(0.0, min(0.95, float(selfie_seg_temporal)))
+        # Previous frame's raw (pre-feather) confidence mask, blended into
+        # this frame's before grow+feather runs -- smooths the boundary
+        # position itself across frames, not just the alpha values.
+        # Capture-thread-only state; reset happens for free on device
+        # switch / restart since a new _CameraWorker is a fresh instance.
+        self._prev_raw_mask: np.ndarray | None = None
         self._segmenter: Any = None
         self._segmenter_failed = False
         # Bumped on every captured frame. Lets the render thread ask "is
@@ -417,12 +439,13 @@ class _CameraWorker(threading.Thread):
         with self._selfie_seg_lock:
             self._selfie_seg_mode = mode if mode in _SELFIE_SEG_MODES else 'off'
 
-    def set_selfie_seg_tuning(self, grow_px: int, feather_px: int, blur_px: int) -> None:
-        """Set the matte grow/feather/blur radii live, from the render thread."""
+    def set_selfie_seg_tuning(self, grow_px: int, feather_px: int, blur_px: int, temporal: float) -> None:
+        """Set the matte grow/feather/blur radii and temporal smoothing live, from the render thread."""
         with self._selfie_seg_lock:
             self._selfie_seg_grow_px = max(0, int(grow_px))
             self._selfie_seg_feather_px = max(0, int(feather_px))
             self._selfie_seg_blur_px = max(0, int(blur_px))
+            self._selfie_seg_temporal = max(0.0, min(0.95, float(temporal)))
 
     def _get_segmenter(self):
         """Lazily create the MediaPipe segmenter. Returns None if unavailable.
@@ -469,6 +492,14 @@ class _CameraWorker(threading.Thread):
             raw_mask = result.confidence_masks[0].numpy_view()  # (H, W) or (H, W, 1) float32, 0..1
             h, w = frame.shape[0], frame.shape[1]
             raw_mask = np.clip(raw_mask, 0.0, 1.0).reshape(h, w)
+            # Temporal smoothing: blend toward the previous frame's raw
+            # mask before grow+feather runs, so the boundary itself moves
+            # smoothly across frames instead of re-deriving from scratch
+            # every frame (the model has no notion of "last frame").
+            t = self._selfie_seg_temporal
+            if t > 0.0 and self._prev_raw_mask is not None and self._prev_raw_mask.shape == raw_mask.shape:
+                raw_mask = t * self._prev_raw_mask + (1.0 - t) * raw_mask
+            self._prev_raw_mask = raw_mask
             alpha = _feather_mask(raw_mask, self._selfie_seg_grow_px, self._selfie_seg_feather_px)
             if self._selfie_seg_mode == 'transparent':
                 return np.dstack((frame, (alpha * 255.0).astype(np.uint8)))
@@ -629,6 +660,8 @@ class WebcamSystem:
         self._selfie_seg_grow_px = max(0, int(cfg.get('selfie_seg_grow_px', _SELFIE_SEG_GROW_PX_DEFAULT)))
         self._selfie_seg_feather_px = max(0, int(cfg.get('selfie_seg_feather_px', _SELFIE_SEG_FEATHER_PX_DEFAULT)))
         self._selfie_seg_blur_px = max(0, int(cfg.get('selfie_seg_blur_px', _SELFIE_SEG_BLUR_PX_DEFAULT)))
+        self._selfie_seg_temporal = max(0.0, min(
+            0.95, float(cfg.get('selfie_seg_temporal', _SELFIE_SEG_TEMPORAL_DEFAULT))))
         self._default_brightness = float(self._brightness)
         self._default_contrast = float(self._contrast)
         self._default_flip_horizontal = bool(self._flip_horizontal)
@@ -1170,25 +1203,28 @@ class WebcamSystem:
                 self._worker.set_selfie_seg_mode(self._selfie_seg)
 
     def _push_selfie_seg_tuning(self) -> None:
-        """Push the current grow/feather/blur radii to the live capture worker."""
+        """Push the current grow/feather/blur/temporal values to the live capture worker."""
         if self._worker is not None:
             self._worker.set_selfie_seg_tuning(
-                self._selfie_seg_grow_px, self._selfie_seg_feather_px, self._selfie_seg_blur_px)
+                self._selfie_seg_grow_px, self._selfie_seg_feather_px,
+                self._selfie_seg_blur_px, self._selfie_seg_temporal)
 
     # -- Configuration-editor convention -------------------------------------
     # One 0/1/2/3 selector per detected camera: selfie-segmentation
     # background mode (off/dim/blur/transparent). The generic Config Editor
     # is slider-only (no native checkbox or dropdown widget), so the mode
     # index rides a stepped slider by the same convention used elsewhere in
-    # the app (e.g. App._set_audio_latency_index). Three more rows tune the
-    # grow/feather/blur radii -- global (not per-camera), since they shape
-    # how the matte looks rather than which camera wants segmentation.
+    # the app (e.g. App._set_audio_latency_index). Four more rows tune the
+    # grow/feather/blur/temporal-smoothing values -- global (not
+    # per-camera), since they shape how the matte looks and behaves rather
+    # than which camera wants segmentation.
     CONFIG_EDITOR_CATEGORY = 'Visuals'
     _SELFIE_SEG_SETTING_PREFIX = 'cam'
     _SELFIE_SEG_SETTING_SUFFIX = '_selfie_seg'
     _SELFIE_SEG_GROW_SETTING = 'selfie_seg_grow_px'
     _SELFIE_SEG_FEATHER_SETTING = 'selfie_seg_feather_px'
     _SELFIE_SEG_BLUR_SETTING = 'selfie_seg_blur_px'
+    _SELFIE_SEG_TEMPORAL_SETTING = 'selfie_seg_temporal'
 
     def config_editor_settings(self) -> list[dict[str, float | str]]:
         # Union _available_cameras with anything already known in memory
@@ -1227,6 +1263,12 @@ class WebcamSystem:
             'name': self._SELFIE_SEG_BLUR_SETTING, 'value': float(self._selfie_seg_blur_px),
             'min': 0.0, 'max': 100.0, 'step': 1.0,
         })
+        settings.append({
+            # Continuous 0-0.95 -- how much of the previous frame's raw
+            # mask carries forward; higher = smoother but laggier.
+            'name': self._SELFIE_SEG_TEMPORAL_SETTING, 'value': float(self._selfie_seg_temporal),
+            'min': 0.0, 'max': 0.95,
+        })
         return settings
 
     def set_config_setting(self, name: str, value: float) -> None:
@@ -1240,6 +1282,10 @@ class WebcamSystem:
             return
         if name == self._SELFIE_SEG_BLUR_SETTING:
             self._selfie_seg_blur_px = max(0, int(round(value)))
+            self._push_selfie_seg_tuning()
+            return
+        if name == self._SELFIE_SEG_TEMPORAL_SETTING:
+            self._selfie_seg_temporal = max(0.0, min(0.95, float(value)))
             self._push_selfie_seg_tuning()
             return
         prefix, suffix = self._SELFIE_SEG_SETTING_PREFIX, self._SELFIE_SEG_SETTING_SUFFIX
@@ -1377,13 +1423,15 @@ class WebcamSystem:
                 selfie_seg_grow_px=self._selfie_seg_grow_px,
                 selfie_seg_feather_px=self._selfie_seg_feather_px,
                 selfie_seg_blur_px=self._selfie_seg_blur_px,
+                selfie_seg_temporal=self._selfie_seg_temporal,
             )
             self._worker.start()
             return
         self._worker.request_device(device)
         self._worker.set_selfie_seg_mode(self._selfie_seg)
         self._worker.set_selfie_seg_tuning(
-            self._selfie_seg_grow_px, self._selfie_seg_feather_px, self._selfie_seg_blur_px)
+            self._selfie_seg_grow_px, self._selfie_seg_feather_px,
+            self._selfie_seg_blur_px, self._selfie_seg_temporal)
 
     def next_camera(self) -> str | None:
         """Switch to the next detected camera device. Returns a label or None if only one."""

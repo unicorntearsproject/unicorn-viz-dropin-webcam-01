@@ -42,6 +42,7 @@ def _system() -> 'wo.WebcamSystem':
     s._selfie_seg_grow_px = wo._SELFIE_SEG_GROW_PX_DEFAULT
     s._selfie_seg_feather_px = wo._SELFIE_SEG_FEATHER_PX_DEFAULT
     s._selfie_seg_blur_px = wo._SELFIE_SEG_BLUR_PX_DEFAULT
+    s._selfie_seg_temporal = wo._SELFIE_SEG_TEMPORAL_DEFAULT
     s._worker = None
     return s
 
@@ -53,6 +54,8 @@ _TUNING_ROWS = [
      'min': 0.0, 'max': 30.0, 'step': 1.0},
     {'name': 'selfie_seg_blur_px', 'value': float(wo._SELFIE_SEG_BLUR_PX_DEFAULT),
      'min': 0.0, 'max': 100.0, 'step': 1.0},
+    {'name': 'selfie_seg_temporal', 'value': float(wo._SELFIE_SEG_TEMPORAL_DEFAULT),
+     'min': 0.0, 'max': 0.95},
 ]
 
 
@@ -144,29 +147,40 @@ def test_config_setting_ignores_unrelated_names() -> None:
     assert s._camera_settings == {}
 
 
-def test_config_setting_tunes_grow_feather_blur_globally() -> None:
+def test_config_setting_tunes_grow_feather_blur_temporal_globally() -> None:
     s = _system()
     s.set_config_setting('selfie_seg_grow_px', 7.0)
     s.set_config_setting('selfie_seg_feather_px', 12.0)
     s.set_config_setting('selfie_seg_blur_px', 60.0)
+    s.set_config_setting('selfie_seg_temporal', 0.8)
     assert s._selfie_seg_grow_px == 7
     assert s._selfie_seg_feather_px == 12
     assert s._selfie_seg_blur_px == 60
+    assert s._selfie_seg_temporal == 0.8
     # No worker attached -- must not raise (no live push target).
     assert s._worker is None
+
+
+def test_config_setting_clamps_temporal_to_valid_range() -> None:
+    s = _system()
+    s.set_config_setting('selfie_seg_temporal', 5.0)
+    assert s._selfie_seg_temporal == 0.95  # never lets the mask freeze entirely
+    s.set_config_setting('selfie_seg_temporal', -1.0)
+    assert s._selfie_seg_temporal == 0.0
 
 
 def test_config_setting_pushes_tuning_to_live_worker() -> None:
     pushed = []
 
     class _FakeWorker:
-        def set_selfie_seg_tuning(self, grow_px, feather_px, blur_px):
-            pushed.append((grow_px, feather_px, blur_px))
+        def set_selfie_seg_tuning(self, grow_px, feather_px, blur_px, temporal):
+            pushed.append((grow_px, feather_px, blur_px, temporal))
 
     s = _system()
     s._worker = _FakeWorker()
     s.set_config_setting('selfie_seg_grow_px', 9.0)
-    assert pushed == [(9, wo._SELFIE_SEG_FEATHER_PX_DEFAULT, wo._SELFIE_SEG_BLUR_PX_DEFAULT)]
+    assert pushed == [(9, wo._SELFIE_SEG_FEATHER_PX_DEFAULT, wo._SELFIE_SEG_BLUR_PX_DEFAULT,
+                        wo._SELFIE_SEG_TEMPORAL_DEFAULT)]
 
 
 def test_remember_and_apply_camera_settings_round_trip_selfie_seg() -> None:
@@ -269,6 +283,8 @@ def _worker() -> 'wo._CameraWorker':
     w._selfie_seg_grow_px = wo._SELFIE_SEG_GROW_PX_DEFAULT
     w._selfie_seg_feather_px = wo._SELFIE_SEG_FEATHER_PX_DEFAULT
     w._selfie_seg_blur_px = wo._SELFIE_SEG_BLUR_PX_DEFAULT
+    w._selfie_seg_temporal = 0.0  # deterministic single-frame tests by default
+    w._prev_raw_mask = None
     w._segmenter = None
     w._segmenter_failed = False
     return w
@@ -288,10 +304,17 @@ def test_set_selfie_seg_mode_rejects_unknown_value() -> None:
     assert w._selfie_seg_mode == 'off'
 
 
-def test_set_selfie_seg_tuning_updates_all_three_radii() -> None:
+def test_set_selfie_seg_tuning_updates_radii_and_temporal() -> None:
     w = _worker()
-    w.set_selfie_seg_tuning(1, 2, 3)
-    assert (w._selfie_seg_grow_px, w._selfie_seg_feather_px, w._selfie_seg_blur_px) == (1, 2, 3)
+    w.set_selfie_seg_tuning(1, 2, 3, 0.7)
+    assert (w._selfie_seg_grow_px, w._selfie_seg_feather_px,
+            w._selfie_seg_blur_px, w._selfie_seg_temporal) == (1, 2, 3, 0.7)
+
+
+def test_set_selfie_seg_tuning_clamps_temporal() -> None:
+    w = _worker()
+    w.set_selfie_seg_tuning(0, 0, 0, 5.0)
+    assert w._selfie_seg_temporal == 0.95
 
 
 def test_get_segmenter_returns_none_and_remembers_when_mediapipe_absent(monkeypatch) -> None:
@@ -367,6 +390,69 @@ def test_apply_selfie_seg_dim_mode_dims_background_leaves_foreground(monkeypatch
     # Deep background column: dimmed to _SELFIE_SEG_BG_DIM of original.
     expected_bg = int(round(200 * wo._SELFIE_SEG_BG_DIM))
     assert np.allclose(out[20, 35, :], expected_bg, atol=2)
+
+
+def test_apply_selfie_seg_updates_prev_raw_mask_for_next_frame(monkeypatch) -> None:
+    mask = np.full((10, 10), 0.8, dtype=np.float32)
+    _patch_mp(monkeypatch)
+    w = _worker()
+    w._selfie_seg_mode = 'dim'
+    w._segmenter = _fake_segmenter_for(mask)
+    frame = np.full((10, 10, 3), 100, dtype=np.uint8)
+    assert w._prev_raw_mask is None
+    w._apply_selfie_seg(frame)
+    assert w._prev_raw_mask is not None
+    assert np.allclose(w._prev_raw_mask, 0.8)
+
+
+def test_apply_selfie_seg_ignores_stale_prev_mask_of_different_shape(monkeypatch) -> None:
+    """A resolution change (e.g. a device switch mid-session) must not try
+    to blend masks of two different shapes."""
+    _patch_mp(monkeypatch)
+    w = _worker()
+    w._selfie_seg_mode = 'dim'
+    w._selfie_seg_temporal = 0.9
+    w._prev_raw_mask = np.zeros((5, 5), dtype=np.float32)  # stale, wrong shape
+    mask = np.ones((10, 10), dtype=np.float32)
+    w._segmenter = _fake_segmenter_for(mask)
+    frame = np.full((10, 10, 3), 100, dtype=np.uint8)
+    out = w._apply_selfie_seg(frame)
+    # Must use this frame's mask directly (all foreground) rather than
+    # crashing or blending against a mismatched shape.
+    assert np.allclose(out, 100, atol=1)
+
+
+def test_apply_selfie_seg_temporal_smoothing_retains_previous_frame_influence(monkeypatch) -> None:
+    """With temporal smoothing on, a frame where the person briefly drops
+    out of the mask must not immediately snap the matte to fully
+    background -- the previous frame's mask should still carry weight.
+    Without smoothing, the same sequence snaps instantly."""
+    mask_frame1 = np.zeros((40, 40), dtype=np.float32)
+    mask_frame1[:, :20] = 1.0  # left half foreground
+    mask_frame2 = np.zeros((40, 40), dtype=np.float32)  # nothing detected this frame
+
+    _patch_mp(monkeypatch)
+    frame = np.full((40, 40, 3), 200, dtype=np.uint8)
+    probe = (20, 5)  # deep foreground in frame 1
+
+    w_instant = _worker()
+    w_instant._selfie_seg_mode = 'dim'
+    w_instant._selfie_seg_temporal = 0.0
+    w_instant._segmenter = _fake_segmenter_for(mask_frame1)
+    w_instant._apply_selfie_seg(frame)
+    w_instant._segmenter = _fake_segmenter_for(mask_frame2)
+    out_instant = w_instant._apply_selfie_seg(frame)
+
+    w_smoothed = _worker()
+    w_smoothed._selfie_seg_mode = 'dim'
+    w_smoothed._selfie_seg_temporal = 0.8
+    w_smoothed._segmenter = _fake_segmenter_for(mask_frame1)
+    w_smoothed._apply_selfie_seg(frame)
+    w_smoothed._segmenter = _fake_segmenter_for(mask_frame2)
+    out_smoothed = w_smoothed._apply_selfie_seg(frame)
+
+    assert out_instant[probe][0] < 100        # instant: dimmed toward background
+    assert out_smoothed[probe][0] > out_instant[probe][0]  # smoothed: still carries frame 1
 
 
 def test_apply_selfie_seg_blur_mode_blurs_background_leaves_foreground(monkeypatch) -> None:
