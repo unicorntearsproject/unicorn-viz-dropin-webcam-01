@@ -1,10 +1,12 @@
 """Regression tests for selfie-segmentation background cutout.
 
-Covers: per-camera mode persistence (off/dim/transparent), Config Editor
-integration (the generic editor is slider-only, so the 3-way mode selector
-rides a stepped 0/1/2 slider by the same convention used elsewhere in the
-app), the grow-then-feather matte helper, and the dim/transparent output
-math (mocking MediaPipe's segmenter -- no model file or camera needed).
+Covers: per-camera mode persistence (off/dim/blur/transparent), Config
+Editor integration (the generic editor is slider-only, so the 4-way mode
+selector rides a stepped 0-3 slider, and the grow/feather/blur radii are
+separate global stepped sliders, all by the same convention used
+elsewhere in the app), the grow-then-feather matte helper, and the
+dim/blur/transparent output math (mocking MediaPipe's segmenter -- no
+model file or camera needed).
 """
 from __future__ import annotations
 
@@ -37,15 +39,29 @@ def _system() -> 'wo.WebcamSystem':
     s._default_flip_vertical = False
     s._selfie_seg = 'off'
     s._default_selfie_seg = 'off'
+    s._selfie_seg_grow_px = wo._SELFIE_SEG_GROW_PX_DEFAULT
+    s._selfie_seg_feather_px = wo._SELFIE_SEG_FEATHER_PX_DEFAULT
+    s._selfie_seg_blur_px = wo._SELFIE_SEG_BLUR_PX_DEFAULT
     s._worker = None
     return s
+
+
+_TUNING_ROWS = [
+    {'name': 'selfie_seg_grow_px', 'value': float(wo._SELFIE_SEG_GROW_PX_DEFAULT),
+     'min': 0.0, 'max': 20.0, 'step': 1.0},
+    {'name': 'selfie_seg_feather_px', 'value': float(wo._SELFIE_SEG_FEATHER_PX_DEFAULT),
+     'min': 0.0, 'max': 30.0, 'step': 1.0},
+    {'name': 'selfie_seg_blur_px', 'value': float(wo._SELFIE_SEG_BLUR_PX_DEFAULT),
+     'min': 0.0, 'max': 100.0, 'step': 1.0},
+]
 
 
 def test_selfie_seg_defaults_off() -> None:
     s = _system()
     assert s.config_editor_settings() == [
-        {'name': 'cam0_selfie_seg', 'value': 0.0, 'min': 0.0, 'max': 2.0, 'step': 1.0},
-        {'name': 'cam2_selfie_seg', 'value': 0.0, 'min': 0.0, 'max': 2.0, 'step': 1.0},
+        {'name': 'cam0_selfie_seg', 'value': 0.0, 'min': 0.0, 'max': 3.0, 'step': 1.0},
+        {'name': 'cam2_selfie_seg', 'value': 0.0, 'min': 0.0, 'max': 3.0, 'step': 1.0},
+        *_TUNING_ROWS,
     ]
 
 
@@ -61,7 +77,8 @@ def test_config_editor_settings_shows_default_device_when_hidden_at_startup() ->
     s._active_device = None
     s._device = 0
     assert s.config_editor_settings() == [
-        {'name': 'cam0_selfie_seg', 'value': 0.0, 'min': 0.0, 'max': 2.0, 'step': 1.0},
+        {'name': 'cam0_selfie_seg', 'value': 0.0, 'min': 0.0, 'max': 3.0, 'step': 1.0},
+        *_TUNING_ROWS,
     ]
 
 
@@ -73,8 +90,9 @@ def test_config_editor_settings_includes_persisted_cameras_not_currently_detecte
     s._camera_settings = {2: {'selfie_seg': 'transparent'}}
     result = s.config_editor_settings()
     assert result == [
-        {'name': 'cam0_selfie_seg', 'value': 0.0, 'min': 0.0, 'max': 2.0, 'step': 1.0},
-        {'name': 'cam2_selfie_seg', 'value': 2.0, 'min': 0.0, 'max': 2.0, 'step': 1.0},
+        {'name': 'cam0_selfie_seg', 'value': 0.0, 'min': 0.0, 'max': 3.0, 'step': 1.0},
+        {'name': 'cam2_selfie_seg', 'value': 3.0, 'min': 0.0, 'max': 3.0, 'step': 1.0},
+        *_TUNING_ROWS,
     ]
 
 
@@ -104,6 +122,8 @@ def test_config_setting_round_trip() -> None:
     s.set_config_setting('cam2_selfie_seg', 1.0)
     assert s._camera_settings[2]['selfie_seg'] == 'dim'
     s.set_config_setting('cam2_selfie_seg', 2.0)
+    assert s._camera_settings[2]['selfie_seg'] == 'blur'
+    s.set_config_setting('cam2_selfie_seg', 3.0)
     assert s._camera_settings[2]['selfie_seg'] == 'transparent'
     s.set_config_setting('cam2_selfie_seg', 0.0)
     assert s._camera_settings[2]['selfie_seg'] == 'off'
@@ -122,6 +142,31 @@ def test_config_setting_ignores_unrelated_names() -> None:
     s.set_config_setting('intensity', 1.0)
     s.set_config_setting('camX_selfie_seg', 1.0)  # not an int -- must not raise
     assert s._camera_settings == {}
+
+
+def test_config_setting_tunes_grow_feather_blur_globally() -> None:
+    s = _system()
+    s.set_config_setting('selfie_seg_grow_px', 7.0)
+    s.set_config_setting('selfie_seg_feather_px', 12.0)
+    s.set_config_setting('selfie_seg_blur_px', 60.0)
+    assert s._selfie_seg_grow_px == 7
+    assert s._selfie_seg_feather_px == 12
+    assert s._selfie_seg_blur_px == 60
+    # No worker attached -- must not raise (no live push target).
+    assert s._worker is None
+
+
+def test_config_setting_pushes_tuning_to_live_worker() -> None:
+    pushed = []
+
+    class _FakeWorker:
+        def set_selfie_seg_tuning(self, grow_px, feather_px, blur_px):
+            pushed.append((grow_px, feather_px, blur_px))
+
+    s = _system()
+    s._worker = _FakeWorker()
+    s.set_config_setting('selfie_seg_grow_px', 9.0)
+    assert pushed == [(9, wo._SELFIE_SEG_FEATHER_PX_DEFAULT, wo._SELFIE_SEG_BLUR_PX_DEFAULT)]
 
 
 def test_remember_and_apply_camera_settings_round_trip_selfie_seg() -> None:
@@ -147,12 +192,46 @@ def test_apply_camera_settings_falls_back_to_default_when_unknown() -> None:
     assert s._selfie_seg == 'off'
 
 
+# ---------------------------------------------------------------------- render
+
+def test_render_skips_border_clear_in_transparent_mode() -> None:
+    """A coloured backplate boxing in a cutout that's supposed to float
+    free over the show reads wrong -- transparent mode must not call
+    _clear_border_ring() at all. Every other mode still gets a border."""
+    calls: list[bool] = []
+    s = wo.WebcamSystem.__new__(wo.WebcamSystem)
+    s._switch_hide_active = False
+    s._hidden = False
+    s.enabled = True
+    s._time = 0.0
+    s._treatment_index = 0  # 'raw' -- current_treatment is a real property
+    s._border_thickness = 4.0
+    s._advance_auto_cycle = lambda dt: None
+    s._get_camera_texture = lambda: SimpleNamespace(use=lambda location: None)
+    s._rect_from_layout = lambda: (0.0, 0.0, 10.0, 10.0)
+    s._write_cam_quad = lambda x, y, w, h: None
+    s._clear_border_ring = lambda x, y, w, h, b: calls.append(True)
+    s._programs = {'raw': {
+        'cam_tex': SimpleNamespace(value=None), 'iBass': SimpleNamespace(value=None),
+        'iTreble': SimpleNamespace(value=None), 'iTime': SimpleNamespace(value=None),
+    }}
+    s._cam_vao_map = {'raw': SimpleNamespace(render=lambda mode: None)}
+
+    s._selfie_seg = 'transparent'
+    wo.WebcamSystem.render(s, dt=0.016, bass=0.0, treble=0.0)
+    assert calls == []
+
+    s._selfie_seg = 'dim'
+    wo.WebcamSystem.render(s, dt=0.016, bass=0.0, treble=0.0)
+    assert calls == [True]
+
+
 # ---------------------------------------------------------------- _feather_mask
 
 def test_feather_mask_grows_foreground_past_original_edge() -> None:
     mask = np.zeros((40, 40), dtype=np.float32)
     mask[:, :20] = 1.0  # left half is foreground
-    alpha = wo._feather_mask(mask)
+    alpha = wo._feather_mask(mask, grow_px=3, feather_px=4)
     assert alpha.shape == mask.shape
     # Deep foreground / deep background, far from any edge, stay near-pure.
     assert alpha[20, 5] > 0.95
@@ -166,12 +245,18 @@ def test_feather_mask_grows_foreground_past_original_edge() -> None:
 def test_feather_mask_produces_a_smooth_ramp_not_a_hard_edge() -> None:
     mask = np.zeros((40, 40), dtype=np.float32)
     mask[:, :20] = 1.0
-    alpha = wo._feather_mask(mask)
+    alpha = wo._feather_mask(mask, grow_px=3, feather_px=4)
     row = alpha[20, :]
     # A hard step would only ever take values near 0.0 or 1.0; feathering
     # must produce genuine intermediate values along the transition.
     intermediate = [v for v in row if 0.05 < v < 0.95]
     assert len(intermediate) >= 3
+
+
+def test_feather_mask_zero_radii_is_a_no_op_binarize() -> None:
+    mask = np.array([[0.2, 0.6], [0.9, 0.4]], dtype=np.float32)
+    alpha = wo._feather_mask(mask, grow_px=0, feather_px=0)
+    assert np.array_equal(alpha, np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.float32))
 
 
 # ---------------------------------------------------------------- _CameraWorker
@@ -181,6 +266,9 @@ def _worker() -> 'wo._CameraWorker':
     w = wo._CameraWorker.__new__(wo._CameraWorker)
     w._selfie_seg_lock = threading.Lock()
     w._selfie_seg_mode = 'dim'
+    w._selfie_seg_grow_px = wo._SELFIE_SEG_GROW_PX_DEFAULT
+    w._selfie_seg_feather_px = wo._SELFIE_SEG_FEATHER_PX_DEFAULT
+    w._selfie_seg_blur_px = wo._SELFIE_SEG_BLUR_PX_DEFAULT
     w._segmenter = None
     w._segmenter_failed = False
     return w
@@ -198,6 +286,12 @@ def test_set_selfie_seg_mode_rejects_unknown_value() -> None:
     w = _worker()
     w.set_selfie_seg_mode('bogus')
     assert w._selfie_seg_mode == 'off'
+
+
+def test_set_selfie_seg_tuning_updates_all_three_radii() -> None:
+    w = _worker()
+    w.set_selfie_seg_tuning(1, 2, 3)
+    assert (w._selfie_seg_grow_px, w._selfie_seg_feather_px, w._selfie_seg_blur_px) == (1, 2, 3)
 
 
 def test_get_segmenter_returns_none_and_remembers_when_mediapipe_absent(monkeypatch) -> None:
@@ -273,6 +367,49 @@ def test_apply_selfie_seg_dim_mode_dims_background_leaves_foreground(monkeypatch
     # Deep background column: dimmed to _SELFIE_SEG_BG_DIM of original.
     expected_bg = int(round(200 * wo._SELFIE_SEG_BG_DIM))
     assert np.allclose(out[20, 35, :], expected_bg, atol=2)
+
+
+def test_apply_selfie_seg_blur_mode_blurs_background_leaves_foreground(monkeypatch) -> None:
+    """Blur mode must leave the deep foreground essentially untouched and
+    replace the deep background with a blurred version -- i.e. a flat
+    background must stay flat (nothing to blur into), so what actually
+    distinguishes blur from dim here is that a *patterned* background
+    gets smoothed out."""
+    mask = np.zeros((60, 60), dtype=np.float32)
+    mask[:, :30] = 1.0  # left half foreground, right half background
+
+    _patch_mp(monkeypatch)
+    w = _worker()
+    w._selfie_seg_mode = 'blur'
+    w._selfie_seg_blur_px = 10
+    w._segmenter = _fake_segmenter_for(mask)
+    frame = np.full((60, 60, 3), 128, dtype=np.uint8)
+    # Sharp checkerboard noise on the background half only.
+    frame[::2, 30:, :] = 250
+    frame[1::2, 30:, :] = 10
+    out = w._apply_selfie_seg(frame)
+
+    assert out.shape == frame.shape  # blur mode stays 3-channel
+    # Deep foreground: untouched.
+    assert np.allclose(out[30, 5, :], 128, atol=1)
+    # Deep background: the checkerboard's per-row 250/10 swing must have
+    # been smoothed toward the middle -- no single pixel this far from
+    # the edge should still read near either extreme.
+    bg_column = out[:, 55, 0].astype(np.int16)
+    assert bg_column.max() < 200
+    assert bg_column.min() > 60
+
+
+def test_apply_selfie_seg_blur_mode_with_zero_radius_is_a_no_op(monkeypatch) -> None:
+    mask = np.ones((10, 10), dtype=np.float32)
+    _patch_mp(monkeypatch)
+    w = _worker()
+    w._selfie_seg_mode = 'blur'
+    w._selfie_seg_blur_px = 0
+    w._segmenter = _fake_segmenter_for(mask)
+    frame = np.full((10, 10, 3), 100, dtype=np.uint8)
+    out = w._apply_selfie_seg(frame)
+    assert np.array_equal(out, frame)
 
 
 def test_apply_selfie_seg_transparent_mode_cuts_alpha(monkeypatch) -> None:

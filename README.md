@@ -1,6 +1,6 @@
 # webcam-01 — Webcam Overlay
 
-**Version 1.2.0**
+**Version 1.3.0**
 
 A drop-in for [unicorn-viz](https://github.com/iDoMeteor/unicorn-viz).
 
@@ -54,13 +54,14 @@ included.
 
 ### Selfie-segmentation background cutout
 
-Optional, per-camera, off by default. Three modes:
+Optional, per-camera, off by default. Four modes:
 
 | Mode | Effect |
 |---|---|
 | `off` | No segmentation runs at all |
 | `dim` | Background dims to 25% of its original brightness |
-| `transparent` | Background cuts to a true per-pixel alpha hole — whatever is already rendered behind the PiP (the show, not a solid backing colour) shows through |
+| `blur` | Background gets a strong Gaussian blur instead of dimming — foreground stays sharp |
+| `transparent` | Background cuts to a true per-pixel alpha hole — whatever is already rendered behind the PiP (the show, not a solid backing colour) shows through, and the PiP border/backplate is skipped entirely so the cutout floats free rather than sitting in a coloured frame |
 
 Runs MediaPipe's selfie-segmentation model on the capture thread (never
 the render thread — inference costs ~8–15 ms, too much of the 16.67 ms
@@ -71,19 +72,19 @@ and carries it straight through to `fragColor.a` (for `glitch`, from the
 un-shifted centre uv, so the cutout edge doesn't wobble with the
 chromatic-aberration offset).
 
-Both modes matte the raw segmentation confidence through the same
-grow-then-feather technique you'd use selecting a background in an image
-editor — grow the selection a couple px, feather, then cut: binarize,
-dilate the kept region by 3 px (past stray fringe pixels like hair), then
-Gaussian-blur by 4 px so the edge reads as a smooth ramp instead of a
-sticker cutout (`_feather_mask()`; not exposed as a config value, same
-convention as the 25% dim fraction).
+Every non-`off` mode mattes the raw segmentation confidence through the
+same grow-then-feather technique you'd use selecting a background in an
+image editor — grow the selection a couple px, feather, then cut:
+binarize, dilate the kept region (past stray fringe pixels like hair),
+then Gaussian-blur the edge so it reads as a smooth ramp instead of a
+sticker cutout (`_feather_mask()`).
 
 `transparent` needs real GPU alpha blending to look right, not just an
 RGBA texture: the border/backplate clear (`_clear_border_ring()`) only
-paints the four ring strips around the PiP, never the inner camera rect,
-so cutout pixels blend against whatever was already drawn there that
-frame instead of a flat backing colour.
+paints the four ring strips around the PiP in every other mode, never
+the inner camera rect, so cutout pixels blend against whatever was
+already drawn there that frame instead of a flat backing colour — and in
+`transparent` specifically, the border is skipped altogether.
 
 Requires `mediapipe` (see `requirements.txt` — needs `--no-deps` to avoid
 a conflict with this project's pinned `opencv-python-headless`) and the
@@ -91,12 +92,22 @@ bundled model at `assets/models/selfie_segmenter.tflite` (Apache 2.0 —
 see `assets/models/NOTICE.md` for provenance/attribution). Absent either,
 the selector silently does nothing rather than erroring.
 
-Select per-camera from the Config Editor's **Visuals** tab — one 0/1/2
+Select per-camera from the Config Editor's **Visuals** tab — one 0-3
 stepped slider per detected camera (the generic Config Editor has no
 native dropdown widget, so the mode index rides a slider by the same
-convention used elsewhere in the app). Not configurable from
-`config.toml` directly, since it's inherently per-camera rather than a
-single scalar.
+convention used elsewhere in the app). The mode itself is per-camera; the
+matte tuning below it is global (shapes every camera's cutout the same
+way, rather than needing to be re-tuned per camera):
+
+| Slider | Meaning | Default | Range |
+|---|---|---|---|
+| `selfie_seg_grow_px` | How far the kept (foreground) region grows past its original edge, in px | 3 | 0–20 |
+| `selfie_seg_feather_px` | Gaussian-blur radius applied to the grown edge, in px | 4 | 0–30 |
+| `selfie_seg_blur_px` | Gaussian-blur radius applied to the whole background in `blur` mode, in px | 35 | 0–100 |
+
+None of this is configurable from `config.toml` directly — mode is
+inherently per-camera, and the tuning sliders are meant for live
+adjustment while watching the feed.
 
 ## Audio reactivity
 
@@ -190,6 +201,18 @@ help overlay. `Alt+[` / `Alt+]` also resize the PiP as an alias for
 
 ## Changelog
 
+- **1.3.0** — Selfie-seg gains a `blur` mode (background gets a strong
+  Gaussian blur instead of dimming; default radius 35px — "DEF huge",
+  per the owner) between `dim` and `transparent`. The `transparent`
+  mode no longer draws the PiP border/backplate at all — a cutout
+  floating over the show read wrong boxed in a coloured frame. The
+  grow/feather/blur radii (previously fixed module constants) are now
+  three global live sliders on the Config Editor's Visuals tab
+  (`selfie_seg_grow_px`, `selfie_seg_feather_px`, `selfie_seg_blur_px`),
+  pushed straight through to the running capture worker. Per-camera mode
+  selector is now a 0–3 stepped slider (was 0–2). 8 new regression
+  tests (blur math, tuning setters/push-to-worker, render()'s
+  border-skip branch), 47 total in this drop-in.
 - **1.2.0** — Selfie-seg gains two more modes: `off` / `dim` (existing) /
   `transparent` (new) — a true per-pixel alpha cutout that reveals
   whatever is already rendered behind the PiP, not a solid backing
