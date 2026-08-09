@@ -175,6 +175,7 @@ def _system_with_worker():
     s._cam_seq = -1
     s._cam_tex = None
     s._cam_tex_size = (0, 0)
+    s._cam_tex_channels = 3
     s._fallback_tex = object()
     s._flip_horizontal = s._flip_vertical = False
     s._brightness = s._contrast = 1.0

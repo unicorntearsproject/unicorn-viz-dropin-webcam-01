@@ -1,6 +1,6 @@
 # webcam-01 — Webcam Overlay
 
-**Version 1.1.2**
+**Version 1.2.0**
 
 A drop-in for [unicorn-viz](https://github.com/iDoMeteor/unicorn-viz).
 
@@ -52,25 +52,48 @@ to plain video. Manual treatment switching (`Ctrl+KP /`, `Ctrl+KP *`) is
 unaffected — it still cycles flatly through every treatment, raw
 included.
 
-### Selfie-segmentation background dim
+### Selfie-segmentation background cutout
 
-Optional, per-camera, off by default. Runs MediaPipe's selfie-segmentation
-model on the capture thread (never the render thread — inference costs
-~8–15 ms, too much of the 16.67 ms frame budget to spend there) and dims
-every background pixel to 25% of its original brightness, leaving the
-detected person untouched. Applied *before* every treatment shader, so
-raw/neon/glitch/vintage/thermal all receive an already-dimmed background
-for free.
+Optional, per-camera, off by default. Three modes:
+
+| Mode | Effect |
+|---|---|
+| `off` | No segmentation runs at all |
+| `dim` | Background dims to 25% of its original brightness |
+| `transparent` | Background cuts to a true per-pixel alpha hole — whatever is already rendered behind the PiP (the show, not a solid backing colour) shows through |
+
+Runs MediaPipe's selfie-segmentation model on the capture thread (never
+the render thread — inference costs ~8–15 ms, too much of the 16.67 ms
+frame budget to spend there). Applied *before* every treatment shader, so
+raw/neon/glitch/vintage/thermal all receive an already-processed
+background for free, alpha included — each shader samples `cam_tex.a`
+and carries it straight through to `fragColor.a` (for `glitch`, from the
+un-shifted centre uv, so the cutout edge doesn't wobble with the
+chromatic-aberration offset).
+
+Both modes matte the raw segmentation confidence through the same
+grow-then-feather technique you'd use selecting a background in an image
+editor — grow the selection a couple px, feather, then cut: binarize,
+dilate the kept region by 3 px (past stray fringe pixels like hair), then
+Gaussian-blur by 4 px so the edge reads as a smooth ramp instead of a
+sticker cutout (`_feather_mask()`; not exposed as a config value, same
+convention as the 25% dim fraction).
+
+`transparent` needs real GPU alpha blending to look right, not just an
+RGBA texture: the border/backplate clear (`_clear_border_ring()`) only
+paints the four ring strips around the PiP, never the inner camera rect,
+so cutout pixels blend against whatever was already drawn there that
+frame instead of a flat backing colour.
 
 Requires `mediapipe` (see `requirements.txt` — needs `--no-deps` to avoid
 a conflict with this project's pinned `opencv-python-headless`) and the
 bundled model at `assets/models/selfie_segmenter.tflite` (Apache 2.0 —
 see `assets/models/NOTICE.md` for provenance/attribution). Absent either,
-the toggle silently does nothing rather than erroring.
+the selector silently does nothing rather than erroring.
 
-Toggle per-camera from the Config Editor's **Visuals** tab — one 0/1
-slider per detected camera (the generic Config Editor has no native
-checkbox widget, so booleans ride a min=0/max=1 slider by the same
+Select per-camera from the Config Editor's **Visuals** tab — one 0/1/2
+stepped slider per detected camera (the generic Config Editor has no
+native dropdown widget, so the mode index rides a slider by the same
 convention used elsewhere in the app). Not configurable from
 `config.toml` directly, since it's inherently per-camera rather than a
 single scalar.
@@ -167,6 +190,26 @@ help overlay. `Alt+[` / `Alt+]` also resize the PiP as an alias for
 
 ## Changelog
 
+- **1.2.0** — Selfie-seg gains two more modes: `off` / `dim` (existing) /
+  `transparent` (new) — a true per-pixel alpha cutout that reveals
+  whatever is already rendered behind the PiP, not a solid backing
+  colour. Both modes now matte the raw segmentation confidence through a
+  grow (3px) + feather (4px) pass (`_feather_mask()`) instead of using
+  it raw, so the cutout edge reads as a smooth ramp past stray fringe
+  pixels rather than a sticker cutout — the same "select background,
+  grow a couple px, feather, cut" technique from an image editor.
+  Required: all 5 treatment shaders now sample and propagate `cam_tex.a`
+  instead of hardcoding opaque output (`glitch` reads alpha from the
+  un-shifted centre uv so the cutout doesn't wobble with the chromatic
+  aberration offset); `_get_camera_texture()` tracks channel count and
+  only brightness/contrast-adjusts the RGB channels, never alpha; the
+  PiP border clear (`_clear_border_ring()`) now paints only the four
+  ring strips around the camera rect instead of the whole backing
+  rectangle, so transparent-mode pixels blend against the actual frame
+  behind the PiP rather than the border colour. The per-camera Config
+  Editor selector is now a 0/1/2 stepped slider (was 0/1). 6 new
+  regression tests (grow/feather math + both modes' pixel output), 40
+  total in this drop-in.
 - **1.1.2** — selfie-seg Config Editor rows declare `step: 1.0` so one
   editor notch flips the 0/1 toggle (with the core default step of
   (max-min)/40, the >= 0.5 quantizing setter floored every nudge back

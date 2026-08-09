@@ -1,9 +1,10 @@
-"""Regression tests for selfie-segmentation background dim.
+"""Regression tests for selfie-segmentation background cutout.
 
-Covers: per-camera setting persistence, Config Editor integration (the
-generic editor is slider-only, so the on/off toggle rides a 0/1 slider by
-the same convention used elsewhere in the app), and the actual dim math
-(mocking MediaPipe's segmenter -- no model file or camera needed).
+Covers: per-camera mode persistence (off/dim/transparent), Config Editor
+integration (the generic editor is slider-only, so the 3-way mode selector
+rides a stepped 0/1/2 slider by the same convention used elsewhere in the
+app), the grow-then-feather matte helper, and the dim/transparent output
+math (mocking MediaPipe's segmenter -- no model file or camera needed).
 """
 from __future__ import annotations
 
@@ -34,8 +35,8 @@ def _system() -> 'wo.WebcamSystem':
     s._default_contrast = 1.0
     s._default_flip_horizontal = False
     s._default_flip_vertical = False
-    s._selfie_seg = False
-    s._default_selfie_seg = False
+    s._selfie_seg = 'off'
+    s._default_selfie_seg = 'off'
     s._worker = None
     return s
 
@@ -43,8 +44,8 @@ def _system() -> 'wo.WebcamSystem':
 def test_selfie_seg_defaults_off() -> None:
     s = _system()
     assert s.config_editor_settings() == [
-        {'name': 'cam0_selfie_seg', 'value': 0.0, 'min': 0.0, 'max': 1.0, 'step': 1.0},
-        {'name': 'cam2_selfie_seg', 'value': 0.0, 'min': 0.0, 'max': 1.0, 'step': 1.0},
+        {'name': 'cam0_selfie_seg', 'value': 0.0, 'min': 0.0, 'max': 2.0, 'step': 1.0},
+        {'name': 'cam2_selfie_seg', 'value': 0.0, 'min': 0.0, 'max': 2.0, 'step': 1.0},
     ]
 
 
@@ -52,15 +53,15 @@ def test_config_editor_settings_shows_default_device_when_hidden_at_startup() ->
     """pip_position = 'hidden' (the shipped default) means start() never
     calls rediscover_cameras() (camera privacy: no probing while hidden),
     so _available_cameras stays empty until the operator manually shows
-    the camera once. The Visuals tab must still offer a toggle for the
-    configured device, or there's no way to pre-set selfie-seg before
-    first show."""
+    the camera once. The Visuals tab must still offer a selector for the
+    configured device, or there's no way to pre-set the mode before first
+    show."""
     s = _system()
     s._available_cameras = []
     s._active_device = None
     s._device = 0
     assert s.config_editor_settings() == [
-        {'name': 'cam0_selfie_seg', 'value': 0.0, 'min': 0.0, 'max': 1.0, 'step': 1.0},
+        {'name': 'cam0_selfie_seg', 'value': 0.0, 'min': 0.0, 'max': 2.0, 'step': 1.0},
     ]
 
 
@@ -69,34 +70,51 @@ def test_config_editor_settings_includes_persisted_cameras_not_currently_detecte
     s._available_cameras = []
     s._active_device = None
     s._device = 0
-    s._camera_settings = {2: {'selfie_seg': True}}
+    s._camera_settings = {2: {'selfie_seg': 'transparent'}}
     result = s.config_editor_settings()
     assert result == [
-        {'name': 'cam0_selfie_seg', 'value': 0.0, 'min': 0.0, 'max': 1.0, 'step': 1.0},
-        {'name': 'cam2_selfie_seg', 'value': 1.0, 'min': 0.0, 'max': 1.0, 'step': 1.0},
+        {'name': 'cam0_selfie_seg', 'value': 0.0, 'min': 0.0, 'max': 2.0, 'step': 1.0},
+        {'name': 'cam2_selfie_seg', 'value': 2.0, 'min': 0.0, 'max': 2.0, 'step': 1.0},
     ]
 
 
 def test_set_camera_selfie_seg_updates_persisted_setting() -> None:
     s = _system()
-    s.set_camera_selfie_seg(2, True)
-    assert s._camera_settings[2]['selfie_seg'] is True
-    # Camera 2 isn't active -- the live flag must not change.
-    assert s._selfie_seg is False
+    s.set_camera_selfie_seg(2, 'dim')
+    assert s._camera_settings[2]['selfie_seg'] == 'dim'
+    # Camera 2 isn't active -- the live mode must not change.
+    assert s._selfie_seg == 'off'
 
 
-def test_set_camera_selfie_seg_on_active_camera_flips_live_flag() -> None:
+def test_set_camera_selfie_seg_on_active_camera_flips_live_mode() -> None:
     s = _system()
-    s.set_camera_selfie_seg(0, True)  # camera 0 is active (see _system())
-    assert s._selfie_seg is True
+    s.set_camera_selfie_seg(0, 'transparent')  # camera 0 is active (see _system())
+    assert s._selfie_seg == 'transparent'
+
+
+def test_set_camera_selfie_seg_rejects_unknown_mode() -> None:
+    s = _system()
+    s.set_camera_selfie_seg(0, 'bogus')
+    assert s._selfie_seg == 'off'
+    assert s._camera_settings[0]['selfie_seg'] == 'off'
 
 
 def test_config_setting_round_trip() -> None:
     s = _system()
     s.set_config_setting('cam2_selfie_seg', 1.0)
-    assert s._camera_settings[2]['selfie_seg'] is True
+    assert s._camera_settings[2]['selfie_seg'] == 'dim'
+    s.set_config_setting('cam2_selfie_seg', 2.0)
+    assert s._camera_settings[2]['selfie_seg'] == 'transparent'
     s.set_config_setting('cam2_selfie_seg', 0.0)
-    assert s._camera_settings[2]['selfie_seg'] is False
+    assert s._camera_settings[2]['selfie_seg'] == 'off'
+
+
+def test_config_setting_clamps_out_of_range_values() -> None:
+    s = _system()
+    s.set_config_setting('cam2_selfie_seg', 99.0)
+    assert s._camera_settings[2]['selfie_seg'] == 'transparent'  # clamps to the top mode
+    s.set_config_setting('cam2_selfie_seg', -5.0)
+    assert s._camera_settings[2]['selfie_seg'] == 'off'  # clamps to the bottom mode
 
 
 def test_config_setting_ignores_unrelated_names() -> None:
@@ -112,21 +130,48 @@ def test_remember_and_apply_camera_settings_round_trip_selfie_seg() -> None:
     s._contrast = 1.0
     s._flip_horizontal = True
     s._flip_vertical = False
-    s._selfie_seg = True
+    s._selfie_seg = 'transparent'
     s._remember_current_camera_settings(0)
-    assert s._camera_settings[0]['selfie_seg'] is True
+    assert s._camera_settings[0]['selfie_seg'] == 'transparent'
 
-    s._selfie_seg = False  # simulate switching away and back
+    s._selfie_seg = 'off'  # simulate switching away and back
     s._apply_camera_settings(0)
-    assert s._selfie_seg is True
+    assert s._selfie_seg == 'transparent'
 
 
 def test_apply_camera_settings_falls_back_to_default_when_unknown() -> None:
     s = _system()
-    s._default_selfie_seg = False
-    s._selfie_seg = True
+    s._default_selfie_seg = 'off'
+    s._selfie_seg = 'dim'
     s._apply_camera_settings(99)  # never remembered
-    assert s._selfie_seg is False
+    assert s._selfie_seg == 'off'
+
+
+# ---------------------------------------------------------------- _feather_mask
+
+def test_feather_mask_grows_foreground_past_original_edge() -> None:
+    mask = np.zeros((40, 40), dtype=np.float32)
+    mask[:, :20] = 1.0  # left half is foreground
+    alpha = wo._feather_mask(mask)
+    assert alpha.shape == mask.shape
+    # Deep foreground / deep background, far from any edge, stay near-pure.
+    assert alpha[20, 5] > 0.95
+    assert alpha[20, 35] < 0.05
+    # A couple of px past the original edge, into what was background,
+    # must now read as at least partially foreground -- proof the
+    # selection grew outward rather than just being blurred in place.
+    assert alpha[20, 21] > 0.5
+
+
+def test_feather_mask_produces_a_smooth_ramp_not_a_hard_edge() -> None:
+    mask = np.zeros((40, 40), dtype=np.float32)
+    mask[:, :20] = 1.0
+    alpha = wo._feather_mask(mask)
+    row = alpha[20, :]
+    # A hard step would only ever take values near 0.0 or 1.0; feathering
+    # must produce genuine intermediate values along the transition.
+    intermediate = [v for v in row if 0.05 < v < 0.95]
+    assert len(intermediate) >= 3
 
 
 # ---------------------------------------------------------------- _CameraWorker
@@ -135,18 +180,24 @@ def _worker() -> 'wo._CameraWorker':
     import threading
     w = wo._CameraWorker.__new__(wo._CameraWorker)
     w._selfie_seg_lock = threading.Lock()
-    w._selfie_seg_enabled = False
+    w._selfie_seg_mode = 'dim'
     w._segmenter = None
     w._segmenter_failed = False
     return w
 
 
-def test_set_selfie_seg_is_thread_safe_toggle() -> None:
+def test_set_selfie_seg_mode_is_thread_safe() -> None:
     w = _worker()
-    w.set_selfie_seg(True)
-    assert w._selfie_seg_enabled is True
-    w.set_selfie_seg(False)
-    assert w._selfie_seg_enabled is False
+    w.set_selfie_seg_mode('transparent')
+    assert w._selfie_seg_mode == 'transparent'
+    w.set_selfie_seg_mode('off')
+    assert w._selfie_seg_mode == 'off'
+
+
+def test_set_selfie_seg_mode_rejects_unknown_value() -> None:
+    w = _worker()
+    w.set_selfie_seg_mode('bogus')
+    assert w._selfie_seg_mode == 'off'
 
 
 def test_get_segmenter_returns_none_and_remembers_when_mediapipe_absent(monkeypatch) -> None:
@@ -174,13 +225,10 @@ def test_apply_selfie_seg_returns_frame_unchanged_when_segmenter_unavailable(mon
     assert np.array_equal(out, frame)
 
 
-def test_apply_selfie_seg_dims_background_leaves_foreground(monkeypatch) -> None:
-    """Foreground (mask=1) pixels must survive untouched; background
-    (mask=0) pixels must scale to _SELFIE_SEG_BG_DIM of their original value."""
+def _fake_segmenter_for(mask_2d: np.ndarray):
     class _FakeMask:
         def numpy_view(self):
-            # Left column = foreground (1.0), right column = background (0.0).
-            return np.array([[1.0, 0.0], [1.0, 0.0]], dtype=np.float32)
+            return mask_2d
 
     class _FakeResult:
         confidence_masks = [_FakeMask()]
@@ -189,6 +237,10 @@ def test_apply_selfie_seg_dims_background_leaves_foreground(monkeypatch) -> None
         def segment(self, mp_image):  # noqa: ARG002
             return _FakeResult()
 
+    return _FakeSegmenter()
+
+
+def _patch_mp(monkeypatch) -> None:
     monkeypatch.setattr(wo, '_MEDIAPIPE', True)
     monkeypatch.setattr(
         wo, '_mp',
@@ -198,32 +250,58 @@ def test_apply_selfie_seg_dims_background_leaves_foreground(monkeypatch) -> None
         ),
     )
 
+
+def test_apply_selfie_seg_dim_mode_dims_background_leaves_foreground(monkeypatch) -> None:
+    """Foreground (mask=1, deep inside the region) must survive
+    essentially untouched; background (mask=0, deep inside the region)
+    must scale down toward _SELFIE_SEG_BG_DIM of its original value. The
+    mask is deliberately larger than the grow+feather kernels so the
+    plateaus away from the edge are unaffected by the transition."""
+    mask = np.zeros((40, 40), dtype=np.float32)
+    mask[:, :20] = 1.0  # left half foreground, right half background
+
+    _patch_mp(monkeypatch)
     w = _worker()
-    w._segmenter = _FakeSegmenter()  # skip _get_segmenter()'s lazy-load path
-    frame = np.full((2, 2, 3), 200, dtype=np.uint8)
+    w._selfie_seg_mode = 'dim'
+    w._segmenter = _fake_segmenter_for(mask)  # skip _get_segmenter()'s lazy-load path
+    frame = np.full((40, 40, 3), 200, dtype=np.uint8)
     out = w._apply_selfie_seg(frame)
 
-    # Foreground column (index 0) untouched.
-    assert np.array_equal(out[:, 0, :], frame[:, 0, :])
-    # Background column (index 1) dimmed to _SELFIE_SEG_BG_DIM of original.
+    assert out.shape == frame.shape  # dim mode stays 3-channel
+    # Deep foreground column: untouched.
+    assert np.allclose(out[20, 5, :], 200, atol=1)
+    # Deep background column: dimmed to _SELFIE_SEG_BG_DIM of original.
     expected_bg = int(round(200 * wo._SELFIE_SEG_BG_DIM))
-    assert np.allclose(out[:, 1, :], expected_bg, atol=1)
+    assert np.allclose(out[20, 35, :], expected_bg, atol=2)
 
 
-def test_apply_selfie_seg_survives_a_bad_frame(monkeypatch) -> None:
+def test_apply_selfie_seg_transparent_mode_cuts_alpha(monkeypatch) -> None:
+    """Transparent mode must return an RGBA frame: colour untouched
+    everywhere, alpha near-opaque deep in the foreground and near-zero
+    deep in the background."""
+    mask = np.zeros((40, 40), dtype=np.float32)
+    mask[:, :20] = 1.0
+
+    _patch_mp(monkeypatch)
+    w = _worker()
+    w._selfie_seg_mode = 'transparent'
+    w._segmenter = _fake_segmenter_for(mask)
+    frame = np.full((40, 40, 3), 200, dtype=np.uint8)
+    out = w._apply_selfie_seg(frame)
+
+    assert out.shape == (40, 40, 4)
+    # Colour channels are never touched by transparent mode -- only alpha.
+    assert np.array_equal(out[..., :3], frame)
+    assert out[20, 5, 3] > 240   # deep foreground: near-opaque
+    assert out[20, 35, 3] < 15   # deep background: near-transparent
+
+
+def test_apply_selfie_seg_survives_a_bad_frame() -> None:
     """A segmenter that raises must not propagate -- return the original frame."""
     class _BrokenSegmenter:
         def segment(self, mp_image):  # noqa: ARG002
             raise RuntimeError('boom')
 
-    monkeypatch.setattr(wo, '_MEDIAPIPE', True)
-    monkeypatch.setattr(
-        wo, '_mp',
-        SimpleNamespace(
-            Image=lambda image_format, data: data,  # noqa: ARG005
-            ImageFormat=SimpleNamespace(SRGB=1),
-        ),
-    )
     w = _worker()
     w._segmenter = _BrokenSegmenter()
     frame = np.full((2, 2, 3), 123, dtype=np.uint8)

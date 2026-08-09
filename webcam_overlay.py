@@ -31,16 +31,26 @@ normal -> effect -> normal -> effect -> ... An effect airs for half of
 (un-halved) `cycle_interval`. Manual treatment switching (Ctrl+KP /, *) is
 unaffected -- it still cycles flatly through every treatment.
 
-Selfie-segmentation background dim (optional, per-camera, off by default):
-a separate effect applied before every treatment above, so raw/neon/glitch/
-vintage/thermal all get an already-dimmed background for free. Needs
-`mediapipe` (see requirements.txt) -- absent, the toggle just does nothing.
-Configured per-camera from the Config Editor's Visuals tab (one 0/1 toggle
-per detected camera), not from config.toml.
+Selfie-segmentation background cutout (optional, per-camera, off by
+default): applied before every treatment above, so raw/neon/glitch/
+vintage/thermal all get an already-processed background for free. Three
+modes -- off / dim / transparent -- selected per-camera from the Config
+Editor's Visuals tab (one 0/1/2 slider per detected camera), not from
+config.toml. Needs `mediapipe` (see requirements.txt) -- absent, the
+selector just does nothing. `transparent` requires the render's blend
+state (enabled globally at context init) and outputs a genuine per-pixel
+alpha cutout, not a solid backing colour -- pixels the segmenter drops
+reveal whatever was already drawn behind the PiP that frame.
+
+Both modes matte the raw segmentation confidence through the same
+grow-then-feather technique as selecting a background in an image editor:
+binarize, dilate the kept region by `_SELFIE_SEG_GROW_PX` to push the edge
+past stray fringe pixels, then Gaussian-blur by `_SELFIE_SEG_FEATHER_PX` so
+the now-hard edge reads as a smooth ramp instead of a sticker cutout.
 """
 from __future__ import annotations
 
-__version__ = '1.1.2'
+__version__ = '1.2.0'
 
 import logging
 import sys
@@ -77,10 +87,17 @@ except Exception:  # pragma: no cover
 
 _SELFIE_SEG_MODEL_PATH = Path(__file__).resolve().parent / 'assets' / 'models' / 'selfie_segmenter.tflite'
 # Background pixels are scaled to this fraction of their original
-# brightness; foreground (person) pixels are left untouched. Applied before
-# every existing treatment shader runs, so raw/neon/glitch/vintage/thermal
-# all receive an already-dimmed background for free.
+# brightness in 'dim' mode; foreground (person) pixels are left untouched.
+# Applied before every existing treatment shader runs, so
+# raw/neon/glitch/vintage/thermal all receive an already-processed
+# background for free.
 _SELFIE_SEG_BG_DIM = 0.25
+# Grow-then-feather matte parameters (image-editor "select background,
+# grow selection a couple px, feather, cut" technique) -- not exposed as
+# a config/slider, same convention as _SELFIE_SEG_BG_DIM above.
+_SELFIE_SEG_GROW_PX = 3
+_SELFIE_SEG_FEATHER_PX = 4
+_SELFIE_SEG_MODES: tuple[str, ...] = ('off', 'dim', 'transparent')
 
 log = logging.getLogger(__name__)
 
@@ -107,7 +124,8 @@ uniform sampler2D cam_tex;
 in  vec2 v_uv;
 out vec4 fragColor;
 void main() {
-    fragColor = vec4(texture(cam_tex, v_uv).rgb, 1.0);
+    vec4 cam = texture(cam_tex, v_uv);
+    fragColor = vec4(cam.rgb, cam.a);
 }
 """,
 
@@ -119,12 +137,13 @@ uniform float iTime;
 in  vec2 v_uv;
 out vec4 fragColor;
 void main() {
-    vec3 col = texture(cam_tex, v_uv).rgb;
+    vec4 cam = texture(cam_tex, v_uv);
+    vec3 col = cam.rgb;
     float punch = 1.0 + iBass * 0.30;
     col *= punch;
     col *= 0.96 + 0.04 * sin((v_uv.y + iTime * 0.2) * 700.0);
     col.b += iBass * 0.06;
-    fragColor = vec4(clamp(col, 0.0, 1.0), 1.0);
+    fragColor = vec4(clamp(col, 0.0, 1.0), cam.a);
 }
 """,
 
@@ -138,6 +157,10 @@ in  vec2 v_uv;
 out vec4 fragColor;
 void main() {
     vec2 uv = v_uv;
+    // Alpha (the segmentation matte) always comes from the un-shifted
+    // centre uv -- the cutout edge must not wobble with the chromatic
+    // aberration / scan-glitch colour offsets below.
+    float a = texture(cam_tex, uv).a;
     float ca = iBass * 0.018 + iTreble * 0.004;
     vec3 col;
     col.r = texture(cam_tex, uv + vec2( ca, 0.0)).r;
@@ -146,7 +169,7 @@ void main() {
     float scan = step(0.72, iBass) * step(0.0, sin(uv.y * 180.0 + iTime * 28.0));
     float shift = scan * iBass * 0.045;
     col = mix(col, texture(cam_tex, vec2(uv.x + shift, uv.y)).rgb, scan);
-    fragColor = vec4(clamp(col, 0.0, 1.0), 1.0);
+    fragColor = vec4(clamp(col, 0.0, 1.0), a);
 }
 """,
 
@@ -158,7 +181,8 @@ uniform float iTime;
 in  vec2 v_uv;
 out vec4 fragColor;
 void main() {
-    vec3 col = texture(cam_tex, v_uv).rgb;
+    vec4 cam = texture(cam_tex, v_uv);
+    vec3 col = cam.rgb;
     vec3 sepia;
     sepia.r = dot(col, vec3(0.393, 0.769, 0.189));
     sepia.g = dot(col, vec3(0.349, 0.686, 0.168));
@@ -170,7 +194,7 @@ void main() {
     float grain = fract(sin(dot(v_uv + iTime * 0.01, vec2(12.9898, 78.233))) * 43758.5453);
     col += (grain - 0.5) * 0.045;
     col.r += iBass * 0.05;
-    fragColor = vec4(clamp(col, 0.0, 1.0), 1.0);
+    fragColor = vec4(clamp(col, 0.0, 1.0), cam.a);
 }
 """,
 
@@ -190,15 +214,41 @@ vec3 thermalPalette(float t) {
     return clamp(col, 0.0, 1.0);
 }
 void main() {
-    vec3 col = texture(cam_tex, v_uv).rgb;
-    float luma = dot(col, vec3(0.299, 0.587, 0.114));
+    vec4 cam = texture(cam_tex, v_uv);
+    float luma = dot(cam.rgb, vec3(0.299, 0.587, 0.114));
     float boosted = clamp(luma + iBass * 0.18, 0.0, 1.0);
-    fragColor = vec4(thermalPalette(boosted), 1.0);
+    fragColor = vec4(thermalPalette(boosted), cam.a);
 }
 """,
 }
 
 _TREATMENT_NAMES: list[str] = ['raw', 'neon', 'glitch', 'vintage', 'thermal']
+
+
+def _feather_mask(mask: np.ndarray) -> np.ndarray:
+    """Grow the foreground selection, then feather the edge.
+
+    Same technique as an image editor's "select the background, grow the
+    selection a couple px, feather, then cut": dilating the binarized
+    foreground pushes the matte edge past stray fringe pixels (hair,
+    motion blur), then a Gaussian blur turns the now-hard edge back into a
+    smooth alpha ramp so the cutout doesn't read as a sticker. Requires
+    cv2 -- only ever called from the capture thread, which already
+    requires _CV2 to run at all (see _CameraWorker.run()).
+
+    ``mask`` is a single-channel float32 array in [0, 1] (foreground
+    confidence); returns a same-shaped float32 array in [0, 1].
+    """
+    binary = (mask >= 0.5).astype(np.uint8) * 255
+    if _SELFIE_SEG_GROW_PX > 0:
+        k = 2 * _SELFIE_SEG_GROW_PX + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        binary = cv2.dilate(binary, kernel)
+    alpha = binary.astype(np.float32) / 255.0
+    if _SELFIE_SEG_FEATHER_PX > 0:
+        k = 2 * _SELFIE_SEG_FEATHER_PX + 1  # cv2.GaussianBlur requires an odd kernel
+        alpha = cv2.GaussianBlur(alpha, (k, k), 0)
+    return np.clip(alpha, 0.0, 1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -210,7 +260,7 @@ class _CameraWorker(threading.Thread):
 
     _MAX_OPEN_FAILURES = 5  # give up after this many consecutive not-found attempts
 
-    def __init__(self, device: int, width: int, height: int, fps: int, selfie_seg: bool = False) -> None:
+    def __init__(self, device: int, width: int, height: int, fps: int, selfie_seg_mode: str = 'off') -> None:
         super().__init__(daemon=True, name='webcam-capture')
         self._device = int(device)
         self._width = int(width)
@@ -225,10 +275,10 @@ class _CameraWorker(threading.Thread):
         # Selfie segmentation runs here (dedicated capture thread), never on
         # the render thread -- inference costs ~8ms, which is a third of
         # the whole 16.67ms render budget on its own. The segmenter model
-        # is loaded lazily, only if this ever flips true, so cameras that
+        # is loaded lazily, only if this ever leaves 'off', so cameras that
         # never use it never pay MediaPipe's ~250KB model load / init cost.
         self._selfie_seg_lock = threading.Lock()
-        self._selfie_seg_enabled = bool(selfie_seg)
+        self._selfie_seg_mode = selfie_seg_mode if selfie_seg_mode in _SELFIE_SEG_MODES else 'off'
         self._segmenter: Any = None
         self._segmenter_failed = False
         # Bumped on every captured frame. Lets the render thread ask "is
@@ -316,7 +366,7 @@ class _CameraWorker(threading.Thread):
                 if ok and frame is not None:
                     frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     frame = cv2.flip(frame, 1)
-                    if self._selfie_seg_enabled:
+                    if self._selfie_seg_mode != 'off':
                         frame = self._apply_selfie_seg(frame)
                     with self._lock:
                         self._latest = frame
@@ -344,10 +394,10 @@ class _CameraWorker(threading.Thread):
         log.debug('WebcamSystem: switch requested -> camera %d', int(device))
         self._switch_event.set()
 
-    def set_selfie_seg(self, enabled: bool) -> None:
-        """Toggle live, from the render thread. Checked once per captured frame."""
+    def set_selfie_seg_mode(self, mode: str) -> None:
+        """Set live, from the render thread. Checked once per captured frame."""
         with self._selfie_seg_lock:
-            self._selfie_seg_enabled = bool(enabled)
+            self._selfie_seg_mode = mode if mode in _SELFIE_SEG_MODES else 'off'
 
     def _get_segmenter(self):
         """Lazily create the MediaPipe segmenter. Returns None if unavailable.
@@ -380,10 +430,10 @@ class _CameraWorker(threading.Thread):
         return self._segmenter
 
     def _apply_selfie_seg(self, frame: np.ndarray) -> np.ndarray:
-        """Dim everything MediaPipe doesn't think is a person.
+        """Cut MediaPipe's idea of the background: dim it, or cut it to alpha.
 
         Returns the frame unchanged on any failure -- a bad frame from a
-        broken segmenter is a much worse experience than a missed dim.
+        broken segmenter is a much worse experience than a missed effect.
         """
         segmenter = self._get_segmenter()
         if segmenter is None:
@@ -391,9 +441,13 @@ class _CameraWorker(threading.Thread):
         try:
             mp_image = _mp.Image(image_format=_mp.ImageFormat.SRGB, data=frame)
             result = segmenter.segment(mp_image)
-            mask = result.confidence_masks[0].numpy_view()  # (H, W) or (H, W, 1) float32, 0..1
-            mask = np.clip(mask, 0.0, 1.0).reshape(frame.shape[0], frame.shape[1], 1)
-            scale = mask + (1.0 - mask) * _SELFIE_SEG_BG_DIM
+            raw_mask = result.confidence_masks[0].numpy_view()  # (H, W) or (H, W, 1) float32, 0..1
+            h, w = frame.shape[0], frame.shape[1]
+            raw_mask = np.clip(raw_mask, 0.0, 1.0).reshape(h, w)
+            alpha = _feather_mask(raw_mask)
+            if self._selfie_seg_mode == 'transparent':
+                return np.dstack((frame, (alpha * 255.0).astype(np.uint8)))
+            scale = (alpha + (1.0 - alpha) * _SELFIE_SEG_BG_DIM).reshape(h, w, 1)
             return np.clip(frame.astype(np.float32) * scale, 0.0, 255.0).astype(np.uint8)
         except Exception as exc:
             log.debug('WebcamSystem: selfie_seg inference failed on a frame: %s', exc)
@@ -527,16 +581,18 @@ class WebcamSystem:
         self._contrast = max(0.2, min(2.0, float(cfg.get('contrast', 1.0))))
         self._flip_horizontal = str(cfg.get('flip_horizontal', 'true')).lower() != 'false'
         self._flip_vertical = str(cfg.get('flip_vertical', 'false')).lower() == 'true'
-        # Selfie-segmentation background dim, per-camera, off by default. A
-        # separate per-camera effect applied before every treatment shader
+        # Selfie-segmentation background cutout: 'off' | 'dim' | 'transparent',
+        # per-camera, off by default. Applied before every treatment shader
         # (raw/neon/glitch/vintage/thermal) -- see _CameraWorker._apply_selfie_seg.
         # Configured per-camera from the Config Editor (Visuals tab), not here.
-        self._selfie_seg = str(cfg.get('selfie_seg', 'false')).lower() == 'true'
+        # _parse_selfie_seg_mode also accepts the legacy true/false spelling
+        # for anyone with an old `selfie_seg = false` line in config.toml.
+        self._selfie_seg = self._parse_selfie_seg_mode(cfg.get('selfie_seg', 'off'))
         self._default_brightness = float(self._brightness)
         self._default_contrast = float(self._contrast)
         self._default_flip_horizontal = bool(self._flip_horizontal)
         self._default_flip_vertical = bool(self._flip_vertical)
-        self._default_selfie_seg = bool(self._selfie_seg)
+        self._default_selfie_seg = str(self._selfie_seg)
         self._remember_current_camera_settings(int(self._device))
 
         self._programs: dict[str, moderngl.Program] = {}
@@ -563,6 +619,7 @@ class WebcamSystem:
 
         self._cam_tex: moderngl.Texture | None = None
         self._cam_tex_size = (0, 0)
+        self._cam_tex_channels = 3
         # Capture sequence already uploaded; -1 forces the first upload.
         self._cam_seq: int = -1
         self._worker: _CameraWorker | None = None
@@ -784,6 +841,17 @@ class WebcamSystem:
             return int(self._active_device)
         return int(self._device)
 
+    @staticmethod
+    def _parse_selfie_seg_mode(value: Any) -> str:
+        """Accept a mode name, or the legacy true/false spelling (pre-modes,
+        'true' only ever meant the one mode that existed then: dim)."""
+        text = str(value).strip().lower()
+        if text in _SELFIE_SEG_MODES:
+            return text
+        if text == 'true':
+            return 'dim'
+        return 'off'
+
     def _remember_current_camera_settings(self, camera_id: int | None = None) -> None:
         target_id = self._active_or_default_device() if camera_id is None else int(camera_id)
         self._camera_settings[target_id] = {
@@ -791,7 +859,7 @@ class WebcamSystem:
             'contrast': float(self._contrast),
             'flip_horizontal': bool(self._flip_horizontal),
             'flip_vertical': bool(self._flip_vertical),
-            'selfie_seg': bool(self._selfie_seg),
+            'selfie_seg': str(self._selfie_seg),
         }
 
     def _apply_camera_settings(self, camera_id: int) -> None:
@@ -801,13 +869,13 @@ class WebcamSystem:
             self._contrast = float(self._default_contrast)
             self._flip_horizontal = bool(self._default_flip_horizontal)
             self._flip_vertical = bool(self._default_flip_vertical)
-            self._selfie_seg = bool(self._default_selfie_seg)
+            self._selfie_seg = str(self._default_selfie_seg)
             return
         self._brightness = max(0.2, min(2.0, float(settings.get('brightness', self._brightness))))
         self._contrast = max(0.2, min(2.0, float(settings.get('contrast', self._contrast))))
         self._flip_horizontal = bool(settings.get('flip_horizontal', self._flip_horizontal))
         self._flip_vertical = bool(settings.get('flip_vertical', self._flip_vertical))
-        self._selfie_seg = bool(settings.get('selfie_seg', self._selfie_seg))
+        self._selfie_seg = self._parse_selfie_seg_mode(settings.get('selfie_seg', self._selfie_seg))
 
     def scale_pip(self, delta: float) -> float:
         self._pip_scale = max(0.12, min(0.80, self._pip_scale + delta))
@@ -1041,27 +1109,31 @@ class WebcamSystem:
         self._remember_current_camera_settings()
         return self._flip_vertical
 
-    def set_camera_selfie_seg(self, device: int, enabled: bool) -> None:
-        """Set the selfie-seg background dim for one camera (any camera, not just active).
+    def set_camera_selfie_seg(self, device: int, mode: str) -> None:
+        """Set the selfie-seg background mode for one camera (any camera, not just active).
 
-        Called from the Config Editor's per-camera checkbox row. Updates
-        the persisted per-camera setting; if `device` is the currently
-        active camera, also flips the live instance flag and pushes it to
-        the running capture worker so the change is visible immediately.
+        ``mode`` is one of _SELFIE_SEG_MODES ('off' | 'dim' | 'transparent');
+        an unrecognized value falls back to 'off'. Called from the Config
+        Editor's per-camera row. Updates the persisted per-camera setting;
+        if `device` is the currently active camera, also flips the live
+        instance mode and pushes it to the running capture worker so the
+        change is visible immediately.
         """
         device = int(device)
+        mode = mode if mode in _SELFIE_SEG_MODES else 'off'
         settings = self._camera_settings.setdefault(device, {})
-        settings['selfie_seg'] = bool(enabled)
+        settings['selfie_seg'] = mode
         if device == self._active_or_default_device():
-            self._selfie_seg = bool(enabled)
+            self._selfie_seg = mode
             if self._worker is not None:
-                self._worker.set_selfie_seg(self._selfie_seg)
+                self._worker.set_selfie_seg_mode(self._selfie_seg)
 
     # -- Configuration-editor convention -------------------------------------
-    # One 0/1 toggle per detected camera: selfie-segmentation background
-    # dim. The generic Config Editor is slider-only (no native checkbox
-    # widget), so booleans ride a min=0/max=1 slider by the same convention
-    # used elsewhere in the app (e.g. App._set_audio_latency_index).
+    # One 0/1/2 selector per detected camera: selfie-segmentation background
+    # mode (off/dim/transparent). The generic Config Editor is slider-only
+    # (no native checkbox or dropdown widget), so the mode index rides a
+    # stepped slider by the same convention used elsewhere in the app (e.g.
+    # App._set_audio_latency_index).
     CONFIG_EDITOR_CATEGORY = 'Visuals'
     _SELFIE_SEG_SETTING_PREFIX = 'cam'
     _SELFIE_SEG_SETTING_SUFFIX = '_selfie_seg'
@@ -1078,16 +1150,16 @@ class WebcamSystem:
         devices.add(self._active_or_default_device())
         settings: list[dict[str, float | str]] = []
         for dev in sorted(devices):
-            enabled = bool(self._camera_settings.get(dev, {}).get('selfie_seg', False))
+            mode = self._camera_settings.get(dev, {}).get('selfie_seg', 'off')
+            mode = mode if mode in _SELFIE_SEG_MODES else 'off'
             settings.append({
                 'name': f'{self._SELFIE_SEG_SETTING_PREFIX}{dev}{self._SELFIE_SEG_SETTING_SUFFIX}',
-                'value': 1.0 if enabled else 0.0,
+                'value': float(_SELFIE_SEG_MODES.index(mode)),
                 'min': 0.0,
-                'max': 1.0,
-                # 0/1 toggle: one editor notch must flip it. Without an
-                # explicit step the editor's (max-min)/40 notch moves the
-                # value 0.025 at a time and set_config_setting()'s >= 0.5
-                # threshold floors it straight back — unreachable.
+                'max': float(len(_SELFIE_SEG_MODES) - 1),
+                # 0=off 1=dim 2=transparent: one editor notch must land on
+                # an exact integer, or set_config_setting()'s round() would
+                # read a value it never actually stepped through.
                 'step': 1.0,
             })
         return settings
@@ -1100,7 +1172,8 @@ class WebcamSystem:
             device = int(name[len(prefix):-len(suffix)])
         except ValueError:
             return
-        self.set_camera_selfie_seg(device, float(value) >= 0.5)
+        index = max(0, min(len(_SELFIE_SEG_MODES) - 1, int(round(value))))
+        self.set_camera_selfie_seg(device, _SELFIE_SEG_MODES[index])
 
     def apply_persistence_state(self, payload: dict[str, Any]) -> None:
         """Apply persisted webcam state before startup."""
@@ -1223,12 +1296,12 @@ class WebcamSystem:
         if self._worker is None or not self._worker.is_alive():
             self._worker = _CameraWorker(
                 device, self._cam_width, self._cam_height, self._cam_fps,
-                selfie_seg=self._selfie_seg,
+                selfie_seg_mode=self._selfie_seg,
             )
             self._worker.start()
             return
         self._worker.request_device(device)
-        self._worker.set_selfie_seg(self._selfie_seg)
+        self._worker.set_selfie_seg_mode(self._selfie_seg)
 
     def next_camera(self) -> str | None:
         """Switch to the next detected camera device. Returns a label or None if only one."""
@@ -1260,6 +1333,43 @@ class WebcamSystem:
     # Render
     # ------------------------------------------------------------------
 
+    def _clear_border_ring(self, x: float, y: float, w: float, h: float, b: float) -> None:
+        """Clear only the border margin around the PiP, never the inner rect.
+
+        The cam quad always fully overwrites the inner rect for the opaque
+        treatments (raw/dim), so clearing the whole outer rect first was
+        harmless there. But in 'transparent' selfie-seg mode, background
+        pixels carry alpha < 1 and blend against whatever is already in the
+        framebuffer -- if that were the border colour (from a full-rect
+        clear), a cutout would reveal a flat backplate instead of the show
+        already rendered behind the PiP. Clearing only the four ring strips
+        leaves the inner rect's existing framebuffer content alone for the
+        cam quad to blend against.
+        """
+        sx = max(0, int(x - b))
+        sy = max(0, int(self._height - (y + h + b)))
+        sw = int(w + 2 * b)
+        sh = int(h + 2 * b)
+        bpx = max(0, int(round(b)))
+        if bpx <= 0 or bpx * 2 >= min(sw, sh):
+            self._ctx.scissor = (sx, sy, sw, sh)
+            self._ctx.clear(*self._border_color)
+            self._ctx.scissor = None
+            return
+        inner_sy = max(0, int(self._height - (y + h)))
+        inner_sh = int(h)
+        for rx, ry, rw, rh in (
+            (sx, sy + sh - bpx, sw, bpx),               # top
+            (sx, sy, sw, bpx),                          # bottom
+            (sx, inner_sy, bpx, inner_sh),               # left
+            (sx + sw - bpx, inner_sy, bpx, inner_sh),    # right
+        ):
+            if rw <= 0 or rh <= 0:
+                continue
+            self._ctx.scissor = (rx, ry, rw, rh)
+            self._ctx.clear(*self._border_color)
+        self._ctx.scissor = None
+
     def render(self, dt: float, bass: float, treble: float) -> None:
         if self._switch_hide_active and time.monotonic() >= self._switch_hide_deadline:
             self._switch_hide_active = False
@@ -1274,13 +1384,7 @@ class WebcamSystem:
         x, y, w, h = self._rect_from_layout()
 
         b = self._border_thickness + bass * (self._border_thickness * 0.75)
-        sx = max(0, int(x - b))
-        sy = max(0, int(self._height - (y + h + b)))
-        sw = int(w + 2 * b)
-        sh = int(h + 2 * b)
-        self._ctx.scissor = (sx, sy, sw, sh)
-        self._ctx.clear(*self._border_color)
-        self._ctx.scissor = None
+        self._clear_border_ring(x, y, w, h, b)
 
         self._write_cam_quad(x, y, w, h)
         tex.use(location=0)
@@ -1333,17 +1437,23 @@ class WebcamSystem:
         elif self._flip_vertical:
             frame = np.ascontiguousarray(frame[::-1, :, :])
         if self._brightness != 1.0 or self._contrast != 1.0:
-            adjusted = frame.astype(np.float32) / 255.0
-            adjusted = (adjusted - 0.5) * self._contrast + 0.5
-            adjusted *= self._brightness
-            frame = np.clip(adjusted * 255.0, 0.0, 255.0).astype(np.uint8)
-        h, w = frame.shape[:2]
-        if self._cam_tex is None or self._cam_tex_size != (w, h):
+            # Brightness/contrast are colour adjustments; a transparent-mode
+            # frame's 4th channel is a segmentation matte, not colour, and
+            # must ride through unscaled.
+            rgb = frame[..., :3].astype(np.float32) / 255.0
+            rgb = (rgb - 0.5) * self._contrast + 0.5
+            rgb *= self._brightness
+            rgb = np.clip(rgb * 255.0, 0.0, 255.0).astype(np.uint8)
+            frame = np.dstack((rgb, frame[..., 3])) if frame.shape[2] == 4 else rgb
+        h, w, channels = frame.shape
+        if (self._cam_tex is None or self._cam_tex_size != (w, h)
+                or self._cam_tex_channels != channels):
             if self._cam_tex is not None:
                 self._cam_tex.release()
-            self._cam_tex = self._ctx.texture((w, h), 3, frame.tobytes())
+            self._cam_tex = self._ctx.texture((w, h), channels, frame.tobytes())
             self._cam_tex.filter = moderngl.LINEAR, moderngl.LINEAR
             self._cam_tex_size = (w, h)
+            self._cam_tex_channels = channels
         else:
             self._cam_tex.write(frame.tobytes())
         return self._cam_tex
