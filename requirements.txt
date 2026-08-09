@@ -1,0 +1,16 @@
+# Optional: selfie-segmentation background dim (per-camera, off by default).
+# NOT auto-installed by the root installer (tools/install/lib.sh only
+# installs the top-level requirements.txt) -- install manually:
+#
+#   pip install --no-deps mediapipe
+#   pip install absl-py flatbuffers
+#
+# --no-deps is required: mediapipe's normal dependency chain pulls in
+# opencv-contrib-python, which collides with this project's pinned
+# opencv-python-headless (both packages own the same `cv2` import path;
+# whichever installs last silently overwrites the other's files, corrupting
+# the shared cv2 install used by webcam capture project-wide). numpy,
+# certifi, matplotlib, and sounddevice are already project dependencies.
+# Guarded import: absent mediapipe just disables the selfie-seg toggle,
+# same as absent PyAV disables videos-01/video-postfx-01's video layers.
+mediapipe==1.0.0

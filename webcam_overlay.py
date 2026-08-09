@@ -23,10 +23,24 @@ Camera treatments:
     glitch    Chromatic aberration + scan scramble on beats
     vintage   Sepia tone, film grain, vignette
     thermal   False-colour luminance heat map
+
+Auto-cycle (Ctrl+KP Enter) alternates normal (raw) and the next treatment
+rather than round-robining flatly through every treatment including raw:
+normal -> effect -> normal -> effect -> ... An effect airs for half of
+`cycle_interval`; the normal interlude between effects airs for the full
+(un-halved) `cycle_interval`. Manual treatment switching (Ctrl+KP /, *) is
+unaffected -- it still cycles flatly through every treatment.
+
+Selfie-segmentation background dim (optional, per-camera, off by default):
+a separate effect applied before every treatment above, so raw/neon/glitch/
+vintage/thermal all get an already-dimmed background for free. Needs
+`mediapipe` (see requirements.txt) -- absent, the toggle just does nothing.
+Configured per-camera from the Config Editor's Visuals tab (one 0/1 toggle
+per detected camera), not from config.toml.
 """
 from __future__ import annotations
 
-__version__ = '1.0.0-rc.4'
+__version__ = '1.1.0'
 
 import logging
 import sys
@@ -44,6 +58,29 @@ try:
 except Exception:  # pragma: no cover
     cv2 = None  # type: ignore
     _CV2 = False
+
+# Optional: selfie-segmentation background dim. Guarded exactly like cv2
+# above -- absent mediapipe just disables the per-camera toggle rather than
+# breaking the drop-in. See requirements.txt for the install command (it
+# needs --no-deps to avoid an opencv-contrib-python/opencv-python-headless
+# conflict).
+try:
+    import mediapipe as _mp  # type: ignore
+    from mediapipe.tasks.python import BaseOptions as _MpBaseOptions  # type: ignore
+    from mediapipe.tasks.python import vision as _mp_vision  # type: ignore
+    _MEDIAPIPE = True
+except Exception:  # pragma: no cover
+    _mp = None  # type: ignore
+    _MpBaseOptions = None  # type: ignore
+    _mp_vision = None  # type: ignore
+    _MEDIAPIPE = False
+
+_SELFIE_SEG_MODEL_PATH = Path(__file__).resolve().parent / 'assets' / 'models' / 'selfie_segmenter.tflite'
+# Background pixels are scaled to this fraction of their original
+# brightness; foreground (person) pixels are left untouched. Applied before
+# every existing treatment shader runs, so raw/neon/glitch/vintage/thermal
+# all receive an already-dimmed background for free.
+_SELFIE_SEG_BG_DIM = 0.25
 
 log = logging.getLogger(__name__)
 
@@ -173,7 +210,7 @@ class _CameraWorker(threading.Thread):
 
     _MAX_OPEN_FAILURES = 5  # give up after this many consecutive not-found attempts
 
-    def __init__(self, device: int, width: int, height: int, fps: int) -> None:
+    def __init__(self, device: int, width: int, height: int, fps: int, selfie_seg: bool = False) -> None:
         super().__init__(daemon=True, name='webcam-capture')
         self._device = int(device)
         self._width = int(width)
@@ -185,6 +222,15 @@ class _CameraWorker(threading.Thread):
         self._switch_event = threading.Event()
         self._requested_device = int(device)
         self._latest: np.ndarray | None = None
+        # Selfie segmentation runs here (dedicated capture thread), never on
+        # the render thread -- inference costs ~8ms, which is a third of
+        # the whole 16.67ms render budget on its own. The segmenter model
+        # is loaded lazily, only if this ever flips true, so cameras that
+        # never use it never pay MediaPipe's ~250KB model load / init cost.
+        self._selfie_seg_lock = threading.Lock()
+        self._selfie_seg_enabled = bool(selfie_seg)
+        self._segmenter: Any = None
+        self._segmenter_failed = False
         # Bumped on every captured frame. Lets the render thread ask "is
         # there anything new?" without paying for a copy of a frame it has
         # already uploaded -- the camera runs at ~30 fps while the display
@@ -270,6 +316,8 @@ class _CameraWorker(threading.Thread):
                 if ok and frame is not None:
                     frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     frame = cv2.flip(frame, 1)
+                    if self._selfie_seg_enabled:
+                        frame = self._apply_selfie_seg(frame)
                     with self._lock:
                         self._latest = frame
                         self._seq += 1
@@ -295,6 +343,61 @@ class _CameraWorker(threading.Thread):
             self._requested_device = int(device)
         log.debug('WebcamSystem: switch requested -> camera %d', int(device))
         self._switch_event.set()
+
+    def set_selfie_seg(self, enabled: bool) -> None:
+        """Toggle live, from the render thread. Checked once per captured frame."""
+        with self._selfie_seg_lock:
+            self._selfie_seg_enabled = bool(enabled)
+
+    def _get_segmenter(self):
+        """Lazily create the MediaPipe segmenter. Returns None if unavailable.
+
+        Called only from this capture thread. A load/init failure is
+        remembered so we don't retry (and re-log) on every single frame.
+        """
+        if self._segmenter is not None or self._segmenter_failed:
+            return self._segmenter
+        if not _MEDIAPIPE:
+            log.warning('WebcamSystem: selfie_seg requested but mediapipe is not installed — '
+                        'see drop-ins/webcam-01/requirements.txt')
+            self._segmenter_failed = True
+            return None
+        if not _SELFIE_SEG_MODEL_PATH.is_file():
+            log.warning('WebcamSystem: selfie_seg model missing at %s', _SELFIE_SEG_MODEL_PATH)
+            self._segmenter_failed = True
+            return None
+        try:
+            options = _mp_vision.ImageSegmenterOptions(
+                base_options=_MpBaseOptions(model_asset_path=str(_SELFIE_SEG_MODEL_PATH)),
+                output_category_mask=False,
+                output_confidence_masks=True,
+            )
+            self._segmenter = _mp_vision.ImageSegmenter.create_from_options(options)
+        except Exception as exc:
+            log.warning('WebcamSystem: failed to load selfie_seg model: %s', exc)
+            self._segmenter_failed = True
+            return None
+        return self._segmenter
+
+    def _apply_selfie_seg(self, frame: np.ndarray) -> np.ndarray:
+        """Dim everything MediaPipe doesn't think is a person.
+
+        Returns the frame unchanged on any failure -- a bad frame from a
+        broken segmenter is a much worse experience than a missed dim.
+        """
+        segmenter = self._get_segmenter()
+        if segmenter is None:
+            return frame
+        try:
+            mp_image = _mp.Image(image_format=_mp.ImageFormat.SRGB, data=frame)
+            result = segmenter.segment(mp_image)
+            mask = result.confidence_masks[0].numpy_view()  # (H, W) or (H, W, 1) float32, 0..1
+            mask = np.clip(mask, 0.0, 1.0).reshape(frame.shape[0], frame.shape[1], 1)
+            scale = mask + (1.0 - mask) * _SELFIE_SEG_BG_DIM
+            return np.clip(frame.astype(np.float32) * scale, 0.0, 255.0).astype(np.uint8)
+        except Exception as exc:
+            log.debug('WebcamSystem: selfie_seg inference failed on a frame: %s', exc)
+            return frame
 
     @property
     def sequence(self) -> int:
@@ -400,6 +503,19 @@ class WebcamSystem:
         self._auto_cycle = False
         self._auto_cycle_interval = float(cfg.get('cycle_interval', 30.0)) or 30.0
         self._auto_cycle_timer = 0.0
+        # Auto-cycle alternates raw (normal) <-> the next real effect treatment,
+        # rather than round-robining flatly through every treatment including
+        # raw: normal -> effect1 -> normal -> effect2 -> ... An effect airs for
+        # half of cycle_interval; the normal interlude between effects airs for
+        # twice that (i.e. the un-halved cycle_interval), so effects read as
+        # brief highlights rather than eating equal screen time to plain video.
+        self._auto_cycle_effect_duration = self._auto_cycle_interval / 2.0
+        self._auto_cycle_normal_duration = self._auto_cycle_interval
+        self._auto_cycle_showing_effect = False
+        # Tracked separately from _treatment_index: that field is 'raw'
+        # throughout the whole normal phase, so it can't tell us which
+        # effect played last once we're back to raw between effects.
+        self._auto_cycle_effect_seq_index = -1
 
         self._available_cameras: list[int] = []
         self._detected_cameras: list[int] = []
@@ -411,10 +527,16 @@ class WebcamSystem:
         self._contrast = max(0.2, min(2.0, float(cfg.get('contrast', 1.0))))
         self._flip_horizontal = str(cfg.get('flip_horizontal', 'true')).lower() != 'false'
         self._flip_vertical = str(cfg.get('flip_vertical', 'false')).lower() == 'true'
+        # Selfie-segmentation background dim, per-camera, off by default. A
+        # separate per-camera effect applied before every treatment shader
+        # (raw/neon/glitch/vintage/thermal) -- see _CameraWorker._apply_selfie_seg.
+        # Configured per-camera from the Config Editor (Visuals tab), not here.
+        self._selfie_seg = str(cfg.get('selfie_seg', 'false')).lower() == 'true'
         self._default_brightness = float(self._brightness)
         self._default_contrast = float(self._contrast)
         self._default_flip_horizontal = bool(self._flip_horizontal)
         self._default_flip_vertical = bool(self._flip_vertical)
+        self._default_selfie_seg = bool(self._selfie_seg)
         self._remember_current_camera_settings(int(self._device))
 
         self._programs: dict[str, moderngl.Program] = {}
@@ -669,6 +791,7 @@ class WebcamSystem:
             'contrast': float(self._contrast),
             'flip_horizontal': bool(self._flip_horizontal),
             'flip_vertical': bool(self._flip_vertical),
+            'selfie_seg': bool(self._selfie_seg),
         }
 
     def _apply_camera_settings(self, camera_id: int) -> None:
@@ -678,11 +801,13 @@ class WebcamSystem:
             self._contrast = float(self._default_contrast)
             self._flip_horizontal = bool(self._default_flip_horizontal)
             self._flip_vertical = bool(self._default_flip_vertical)
+            self._selfie_seg = bool(self._default_selfie_seg)
             return
         self._brightness = max(0.2, min(2.0, float(settings.get('brightness', self._brightness))))
         self._contrast = max(0.2, min(2.0, float(settings.get('contrast', self._contrast))))
         self._flip_horizontal = bool(settings.get('flip_horizontal', self._flip_horizontal))
         self._flip_vertical = bool(settings.get('flip_vertical', self._flip_vertical))
+        self._selfie_seg = bool(settings.get('selfie_seg', self._selfie_seg))
 
     def scale_pip(self, delta: float) -> float:
         self._pip_scale = max(0.12, min(0.80, self._pip_scale + delta))
@@ -718,10 +843,55 @@ class WebcamSystem:
         self._treatment_index = (self._treatment_index - 1) % len(_TREATMENT_NAMES)
         return _TREATMENT_NAMES[self._treatment_index]
 
+    def _next_cycle_effect_treatment(self) -> str:
+        """Advance to the next non-raw treatment, for auto-cycle's effect phase.
+
+        Manual next/prev_treatment() still round-robin flatly through every
+        treatment including raw; only auto-cycle skips raw here since raw is
+        auto-cycle's own separate "normal" phase, not one of the effects it
+        rotates through. Uses its own sequence index rather than deriving
+        "current" from _treatment_index, which reads 'raw' throughout the
+        whole normal phase and so can't say which effect played last.
+        """
+        effects = [t for t in _TREATMENT_NAMES if t != 'raw']
+        self._auto_cycle_effect_seq_index = (self._auto_cycle_effect_seq_index + 1) % len(effects)
+        next_name = effects[self._auto_cycle_effect_seq_index]
+        self._treatment_index = _TREATMENT_NAMES.index(next_name)
+        return next_name
+
     def toggle_auto_cycle(self) -> bool:
         self._auto_cycle = not self._auto_cycle
         self._auto_cycle_timer = 0.0
+        self._auto_cycle_showing_effect = False
+        if self._auto_cycle:
+            self._treatment_index = _TREATMENT_NAMES.index('raw')
         return self._auto_cycle
+
+    def _advance_auto_cycle(self, dt: float) -> None:
+        """Tick the normal/effect alternation; no-op unless auto-cycle is on.
+
+        Pattern: normal -> effect -> normal -> effect -> ... An effect airs
+        for _auto_cycle_effect_duration; the normal interlude between
+        effects airs for _auto_cycle_normal_duration (2x the effect
+        duration). Split out from render() so it's unit-testable without a
+        camera/GL context.
+        """
+        if not self._auto_cycle:
+            return
+        self._auto_cycle_timer += dt
+        duration = (
+            self._auto_cycle_effect_duration if self._auto_cycle_showing_effect
+            else self._auto_cycle_normal_duration
+        )
+        if self._auto_cycle_timer < duration:
+            return
+        self._auto_cycle_timer = 0.0
+        if self._auto_cycle_showing_effect:
+            self._treatment_index = _TREATMENT_NAMES.index('raw')
+            self._auto_cycle_showing_effect = False
+        else:
+            self._next_cycle_effect_treatment()
+            self._auto_cycle_showing_effect = True
 
     @staticmethod
     def _enumerate_cameras() -> list[int]:
@@ -871,6 +1041,53 @@ class WebcamSystem:
         self._remember_current_camera_settings()
         return self._flip_vertical
 
+    def set_camera_selfie_seg(self, device: int, enabled: bool) -> None:
+        """Set the selfie-seg background dim for one camera (any camera, not just active).
+
+        Called from the Config Editor's per-camera checkbox row. Updates
+        the persisted per-camera setting; if `device` is the currently
+        active camera, also flips the live instance flag and pushes it to
+        the running capture worker so the change is visible immediately.
+        """
+        device = int(device)
+        settings = self._camera_settings.setdefault(device, {})
+        settings['selfie_seg'] = bool(enabled)
+        if device == self._active_or_default_device():
+            self._selfie_seg = bool(enabled)
+            if self._worker is not None:
+                self._worker.set_selfie_seg(self._selfie_seg)
+
+    # -- Configuration-editor convention -------------------------------------
+    # One 0/1 toggle per detected camera: selfie-segmentation background
+    # dim. The generic Config Editor is slider-only (no native checkbox
+    # widget), so booleans ride a min=0/max=1 slider by the same convention
+    # used elsewhere in the app (e.g. App._set_audio_latency_index).
+    CONFIG_EDITOR_CATEGORY = 'Visuals'
+    _SELFIE_SEG_SETTING_PREFIX = 'cam'
+    _SELFIE_SEG_SETTING_SUFFIX = '_selfie_seg'
+
+    def config_editor_settings(self) -> list[dict[str, float | str]]:
+        settings: list[dict[str, float | str]] = []
+        for dev in self._available_cameras:
+            enabled = bool(self._camera_settings.get(dev, {}).get('selfie_seg', False))
+            settings.append({
+                'name': f'{self._SELFIE_SEG_SETTING_PREFIX}{dev}{self._SELFIE_SEG_SETTING_SUFFIX}',
+                'value': 1.0 if enabled else 0.0,
+                'min': 0.0,
+                'max': 1.0,
+            })
+        return settings
+
+    def set_config_setting(self, name: str, value: float) -> None:
+        prefix, suffix = self._SELFIE_SEG_SETTING_PREFIX, self._SELFIE_SEG_SETTING_SUFFIX
+        if not (name.startswith(prefix) and name.endswith(suffix)):
+            return
+        try:
+            device = int(name[len(prefix):-len(suffix)])
+        except ValueError:
+            return
+        self.set_camera_selfie_seg(device, float(value) >= 0.5)
+
     def apply_persistence_state(self, payload: dict[str, Any]) -> None:
         """Apply persisted webcam state before startup."""
         if not isinstance(payload, dict):
@@ -990,10 +1207,14 @@ class WebcamSystem:
             self._available_cameras,
         )
         if self._worker is None or not self._worker.is_alive():
-            self._worker = _CameraWorker(device, self._cam_width, self._cam_height, self._cam_fps)
+            self._worker = _CameraWorker(
+                device, self._cam_width, self._cam_height, self._cam_fps,
+                selfie_seg=self._selfie_seg,
+            )
             self._worker.start()
             return
         self._worker.request_device(device)
+        self._worker.set_selfie_seg(self._selfie_seg)
 
     def next_camera(self) -> str | None:
         """Switch to the next detected camera device. Returns a label or None if only one."""
@@ -1033,12 +1254,7 @@ class WebcamSystem:
             return
 
         self._time += dt
-
-        if self._auto_cycle:
-            self._auto_cycle_timer += dt
-            if self._auto_cycle_timer >= self._auto_cycle_interval:
-                self._auto_cycle_timer = 0.0
-                self.next_treatment()
+        self._advance_auto_cycle(dt)
 
         tex = self._get_camera_texture()
         x, y, w, h = self._rect_from_layout()
