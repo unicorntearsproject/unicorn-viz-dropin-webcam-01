@@ -1,6 +1,6 @@
 # webcam-01 — Webcam Overlay
 
-**Version 1.1.1**
+**Version 1.1.2**
 
 A drop-in for [unicorn-viz](https://github.com/iDoMeteor/unicorn-viz).
 
@@ -167,6 +167,10 @@ help overlay. `Alt+[` / `Alt+]` also resize the PiP as an alias for
 
 ## Changelog
 
+- **1.1.2** — selfie-seg Config Editor rows declare `step: 1.0` so one
+  editor notch flips the 0/1 toggle (with the core default step of
+  (max-min)/40, the >= 0.5 quantizing setter floored every nudge back
+  to 0 and the toggle was unreachable by click or scroll).
 - **1.1.1** — Fixes the Config Editor's Visuals tab showing zero
   selfie-seg rows to toggle. `config_editor_settings()` only iterated
   `_available_cameras`, which stays empty until the camera has been

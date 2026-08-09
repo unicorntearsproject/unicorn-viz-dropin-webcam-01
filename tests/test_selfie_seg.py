@@ -43,8 +43,8 @@ def _system() -> 'wo.WebcamSystem':
 def test_selfie_seg_defaults_off() -> None:
     s = _system()
     assert s.config_editor_settings() == [
-        {'name': 'cam0_selfie_seg', 'value': 0.0, 'min': 0.0, 'max': 1.0},
-        {'name': 'cam2_selfie_seg', 'value': 0.0, 'min': 0.0, 'max': 1.0},
+        {'name': 'cam0_selfie_seg', 'value': 0.0, 'min': 0.0, 'max': 1.0, 'step': 1.0},
+        {'name': 'cam2_selfie_seg', 'value': 0.0, 'min': 0.0, 'max': 1.0, 'step': 1.0},
     ]
 
 
@@ -60,7 +60,7 @@ def test_config_editor_settings_shows_default_device_when_hidden_at_startup() ->
     s._active_device = None
     s._device = 0
     assert s.config_editor_settings() == [
-        {'name': 'cam0_selfie_seg', 'value': 0.0, 'min': 0.0, 'max': 1.0},
+        {'name': 'cam0_selfie_seg', 'value': 0.0, 'min': 0.0, 'max': 1.0, 'step': 1.0},
     ]
 
 
@@ -72,8 +72,8 @@ def test_config_editor_settings_includes_persisted_cameras_not_currently_detecte
     s._camera_settings = {2: {'selfie_seg': True}}
     result = s.config_editor_settings()
     assert result == [
-        {'name': 'cam0_selfie_seg', 'value': 0.0, 'min': 0.0, 'max': 1.0},
-        {'name': 'cam2_selfie_seg', 'value': 1.0, 'min': 0.0, 'max': 1.0},
+        {'name': 'cam0_selfie_seg', 'value': 0.0, 'min': 0.0, 'max': 1.0, 'step': 1.0},
+        {'name': 'cam2_selfie_seg', 'value': 1.0, 'min': 0.0, 'max': 1.0, 'step': 1.0},
     ]
 
 

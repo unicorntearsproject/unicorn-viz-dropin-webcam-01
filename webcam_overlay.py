@@ -40,7 +40,7 @@ per detected camera), not from config.toml.
 """
 from __future__ import annotations
 
-__version__ = '1.1.1'
+__version__ = '1.1.2'
 
 import logging
 import sys
@@ -1084,6 +1084,11 @@ class WebcamSystem:
                 'value': 1.0 if enabled else 0.0,
                 'min': 0.0,
                 'max': 1.0,
+                # 0/1 toggle: one editor notch must flip it. Without an
+                # explicit step the editor's (max-min)/40 notch moves the
+                # value 0.025 at a time and set_config_setting()'s >= 0.5
+                # threshold floors it straight back — unreachable.
+                'step': 1.0,
             })
         return settings
 
