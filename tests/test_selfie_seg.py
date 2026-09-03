@@ -43,6 +43,9 @@ def _system() -> 'wo.WebcamSystem':
     s._selfie_seg_feather_px = wo._SELFIE_SEG_FEATHER_PX_DEFAULT
     s._selfie_seg_blur_px = wo._SELFIE_SEG_BLUR_PX_DEFAULT
     s._selfie_seg_temporal = wo._SELFIE_SEG_TEMPORAL_DEFAULT
+    s._border_style = 'futuristic'
+    s._border_intensity = 1.0
+    s._border_hue_speed = 0.05
     s._worker = None
     return s
 
@@ -56,6 +59,10 @@ _TUNING_ROWS = [
      'min': 0.0, 'max': 100.0, 'step': 1.0},
     {'name': 'selfie_seg_temporal', 'value': float(wo._SELFIE_SEG_TEMPORAL_DEFAULT),
      'min': 0.0, 'max': 0.95},
+    {'name': 'border_style', 'value': float(wo._BORDER_STYLES.index('futuristic')),
+     'min': 0.0, 'max': float(len(wo._BORDER_STYLES) - 1), 'step': 1.0},
+    {'name': 'border_intensity', 'value': 1.0, 'min': 0.0, 'max': 2.0},
+    {'name': 'border_hue_speed', 'value': 0.05, 'min': 0.0, 'max': 1.0},
 ]
 
 
@@ -220,6 +227,7 @@ def test_render_skips_border_clear_in_transparent_mode() -> None:
     s._time = 0.0
     s._treatment_index = 0  # 'raw' -- current_treatment is a real property
     s._border_thickness = 4.0
+    s._border_style = 'classic'  # exercise the classic _clear_border_ring path
     s._advance_auto_cycle = lambda dt: None
     s._get_camera_texture = lambda: SimpleNamespace(use=lambda location: None)
     s._rect_from_layout = lambda: (0.0, 0.0, 10.0, 10.0)

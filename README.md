@@ -1,6 +1,6 @@
 # webcam-01 — Webcam Overlay
 
-**Version 1.4.0**
+**Version 1.5.0**
 
 A drop-in for [unicorn-viz](https://github.com/iDoMeteor/unicorn-viz).
 
@@ -21,17 +21,19 @@ the camera never opens at all if the configured startup position is
 
 ## Visual treatments
 
-Five shaders the live feed can be rendered through, cycled with
+Seven shaders the live feed can be rendered through, cycled with
 `Ctrl+KP /` and `Ctrl+KP *` (see `_TREATMENT_FRAGS` / `_TREATMENT_NAMES`
 in `webcam_overlay.py`):
 
 | Treatment | What it does |
 |---|---|
-| `raw`     | Clean feed, no processing |
-| `neon`    | Bass-reactive exposure punch + scanline modulation, slight blue push |
-| `glitch`  | Bass/treble-driven chromatic aberration and beat-triggered scanline scramble |
-| `vintage` | Sepia tone, vignette, animated film grain, bass-reactive red push |
-| `thermal` | Luminance mapped through a false-colour heat palette, bass-boosted |
+| `raw`       | Clean feed, no processing |
+| `neon`      | Bass-reactive exposure punch + scanline modulation, slight blue push |
+| `glitch`    | Bass/treble-driven chromatic aberration and beat-triggered scanline scramble |
+| `vintage`   | Sepia tone, vignette, animated film grain, bass-reactive red push |
+| `thermal`   | Luminance mapped through a false-colour heat palette, bass-boosted |
+| `posterize` | Cel-shaded colour quantization (bass briefly coarsens the levels) + a Sobel-derived neon edge outline (hue-cycling, treble-reactive) |
+| `halftone`  | Retro CMYK-print dot-matrix look — bass shrinks the dot pitch and widens each dot's radius on a hit, treble spins the grid angle, hue drifts slowly |
 
 The default treatment is `neon` (or `[webcam] treatment`, if set).
 
@@ -52,6 +54,40 @@ to plain video. Manual treatment switching (`Ctrl+KP /`, `Ctrl+KP *`) is
 unaffected — it still cycles flatly through every treatment, raw
 included.
 
+### PiP border
+
+`[webcam] border_style` picks the look of the ring drawn around the PiP
+(`_clear_border_ring()` for `classic`, `_draw_border_futuristic()` +
+`_BORDER_FRAG` for `futuristic`):
+
+| Style | Look |
+|---|---|
+| `off` | No border/backplate drawn at all |
+| `classic` | The original flat-colour ring (`border_color`, `border_thickness`) |
+| `futuristic` (default) | Glowing neon/HUD frame: crisp corner-bracket accents, a treble-reactive scanline sweep, and organic bass/beat-reactive "drip" tendrils that locally thicken the ring — heavier toward the bottom (gravity) and on a bass hit (sag), the same wave-widens-with-bass / extra-sag-on-beat idea as banner-01's `_draw_drippy_text`, adapted from per-character text motion to a border ring's local thickness |
+
+`futuristic` is configurable, not one hardcoded look — `border_intensity`
+(0–2) dials the overall glow/drip strength, and it keeps varying on its
+own regardless of config: the drip motion is always alive (never fully
+static, like the base wobble in `_draw_drippy_text`), and the neon hue
+slowly drifts over time at `border_hue_speed` full turns/second, starting
+from `border_color`'s own hue (`_hue_from_color()`) so the configured
+tint still sets the starting point. A bass-transient ("beat-ish") pulse
+is approximated by thresholding `iBass` — this drop-in's `render()` only
+receives bass/treble, not a true beat trigger, the same idiom the
+`glitch` treatment already uses for its scan-scramble.
+
+Interior pixels of the ring shader are always fully transparent; the
+opaque camera quad drawn immediately afterward redraws its own exact
+rect on top regardless, so drips only ever grow the ring *outward* (into
+a reserved padding margin) rather than bulging into the frame, where
+they'd just be invisible.
+
+None of `border_style` / `border_intensity` / `border_hue_speed` are
+per-camera — set them in `config.toml`, or live from the Config Editor's
+Visuals tab (`border_style` rides a 0–2 stepped slider by the same
+"no native dropdown" convention as the selfie-seg mode selector below).
+
 ### Selfie-segmentation background cutout
 
 Optional, per-camera, off by default. Four modes:
@@ -66,8 +102,8 @@ Optional, per-camera, off by default. Four modes:
 Runs MediaPipe's selfie-segmentation model on the capture thread (never
 the render thread — inference costs ~8–15 ms, too much of the 16.67 ms
 frame budget to spend there). Applied *before* every treatment shader, so
-raw/neon/glitch/vintage/thermal all receive an already-processed
-background for free, alpha included — each shader samples `cam_tex.a`
+all seven treatments receive an already-processed background for free,
+alpha included — each shader samples `cam_tex.a`
 and carries it straight through to `fragColor.a` (for `glitch`, from the
 un-shifted centre uv, so the cutout edge doesn't wobble with the
 chromatic-aberration offset).
@@ -85,11 +121,12 @@ reads as a shaky/flickery edge. Blending smooths the boundary's actual
 position, not just the already-feathered alpha values.
 
 `transparent` needs real GPU alpha blending to look right, not just an
-RGBA texture: the border/backplate clear (`_clear_border_ring()`) only
-paints the four ring strips around the PiP in every other mode, never
-the inner camera rect, so cutout pixels blend against whatever was
-already drawn there that frame instead of a flat backing colour — and in
-`transparent` specifically, the border is skipped altogether.
+RGBA texture: whichever border style is active only ever paints the ring
+around the PiP (never the inner camera rect) in every other selfie-seg
+mode, so cutout pixels blend against whatever was already drawn there
+that frame instead of a flat backing colour or a border shader's glow —
+and in `transparent` specifically, no border is drawn at all, regardless
+of `border_style`.
 
 Requires `mediapipe` (see `requirements.txt` — needs `--no-deps` to avoid
 a conflict with this project's pinned `opencv-python-headless`) and the
@@ -117,13 +154,14 @@ adjustment while watching the feed.
 
 ## Audio reactivity
 
-Only `raw` is silent. Every other treatment reads `iBass`; `glitch` is
-the only one that also reads `iTreble`.
+Only `raw` is silent. Every other treatment reads `iBass`; `glitch`,
+`posterize` and `halftone` also read `iTreble`. The `futuristic` border
+style reads both, independent of whichever treatment is showing.
 
 | Signal | Effect |
 |---|---|
-| `bass` (`iBass`) | `neon`: exposure punch + faint blue push. `glitch`: chromatic-aberration spread + probability/magnitude of the beat-triggered scanline scramble. `vintage`: red-channel push. `thermal`: luminance boost before the heat-palette lookup. Also drives the PiP border's glow/thickness pulse in `render()`, independent of treatment. |
-| `treble` (`iTreble`) | `glitch` only: adds to the chromatic-aberration spread. |
+| `bass` (`iBass`) | `neon`: exposure punch + faint blue push. `glitch`: chromatic-aberration spread + probability/magnitude of the beat-triggered scanline scramble. `vintage`: red-channel push. `thermal`: luminance boost before the heat-palette lookup. `posterize`: briefly coarsens the colour quantization on a hit. `halftone`: shrinks the dot pitch and widens each dot's radius on a hit. Also drives the PiP border's ring-thickness pulse in every style, and the `futuristic` style's drip-tendril length/sag (a bass-transient pulse approximates a "beat" since `render()` has no `iBeat`). |
+| `treble` (`iTreble`) | `glitch`: adds to the chromatic-aberration spread. `posterize`: speeds up and brightens the edge outline's hue cycle. `halftone`: spins the dot-grid angle. `futuristic` border: brightens/densifies the scanline sweep. |
 
 ## Requirements
 
@@ -168,9 +206,14 @@ pip_position      = "bottom_right" # top_left | top_center | top_right |
                                     # bottom_left | bottom_center | bottom_right |
                                     # fullscreen | hidden
 pip_scale         = 0.33           # fraction of viewport width (0.12-0.80)
-border_thickness  = 8.0            # border/backplate thickness in pixels
-border_color      = [0.04, 0.72, 1.0, 0.28]  # RGBA, 0.0-1.0
-treatment         = "neon"         # raw | neon | glitch | vintage | thermal
+border_thickness  = 8.0            # base ring thickness in pixels (all styles)
+border_color      = [0.04, 0.72, 1.0, 0.28]  # RGBA, 0.0-1.0; also seeds the
+                                    # futuristic style's starting neon hue
+border_style      = "futuristic"   # off | classic | futuristic -- see PiP border above
+border_intensity  = 1.0            # futuristic style: overall glow/drip strength, 0.0-2.0
+border_hue_speed  = 0.05           # futuristic style: neon hue drift, full turns/second, 0.0-1.0
+treatment         = "neon"         # raw | neon | glitch | vintage | thermal |
+                                    # posterize | halftone
 cycle_interval    = 30             # seconds; see Auto-cycle above
 brightness        = 1.0            # software multiplier, 0.2-2.0
 contrast          = 1.0            # software multiplier, 0.2-2.0
@@ -217,6 +260,39 @@ help overlay. `Alt+[` / `Alt+]` also resize the PiP as an alias for
   instance, or a mismatched cached shape) just starts smoothing over.
   6 new regression tests (prev-mask bookkeeping, shape-mismatch safety,
   a direct instant-vs-smoothed comparison), 52 total in this drop-in.
+- **1.5.0** — Two additions:
+  1. Two new treatments: `posterize` (cel-shaded colour quantization +
+     a Sobel-derived, hue-cycling neon edge outline) and `halftone`
+     (retro CMYK-print dot matrix, bass/treble-reactive pitch and grid
+     angle). `_TREATMENT_NAMES` grows from five entries to seven; both
+     read `iBass`/`iTreble`/`iTime` like the existing shaders.
+  2. The PiP border is redesigned. A new `border_style` config key picks
+     `off` / `classic` (the original flat ring, unchanged) / `futuristic`
+     (new default): a glowing neon/HUD frame with corner-bracket accents,
+     a treble-reactive scanline sweep, and organic bass/beat-reactive
+     "drip" tendrils that locally thicken the ring — heavier at the
+     bottom (gravity) and on a bass hit (sag), adapting banner-01's
+     `_draw_drippy_text` wave-widens-with-bass/extra-sag-on-beat idea
+     from per-character text motion to a border ring's local thickness.
+     Rendered via a new `_BORDER_FRAG` shader + `_border_prog`/
+     `_border_vao`/`_border_vbo` GL resources (replacing the flat
+     `_clear_border_ring()` scissor-clear for this style only —
+     `classic` still uses it unchanged). Configurable via
+     `border_intensity` (0-2, overall glow/drip strength) and
+     `border_hue_speed` (0-1, neon hue drift in turns/second, seeded
+     from `border_color`'s own hue via the new `_hue_from_color()`); it
+     also keeps varying on its own regardless of config — the drip
+     motion is always alive and the hue keeps drifting — so a long
+     session doesn't read static. All three are live sliders on the
+     Config Editor's Visuals tab, same "no native dropdown" stepped-
+     slider convention as the selfie-seg mode selector. `_quad_verts()`
+     factors the shared pixel-to-clip-space quad math out of
+     `_write_cam_quad()` so the new `_write_border_quad()` (camera rect
+     grown by a padding margin that reserves room for drips) can reuse
+     it exactly. No border of any style is drawn in `transparent`
+     selfie-seg mode, matching the 1.3.0 behaviour. 24 new regression
+     tests (style dispatch, hue extraction, uniform/geometry math,
+     Config Editor round-trip, construction), 76 total in this drop-in.
 - **1.3.0** — Selfie-seg gains a `blur` mode (background gets a strong
   Gaussian blur instead of dimming; default radius 35px — "DEF huge",
   per the owner) between `dim` and `transparent`. The `transparent`

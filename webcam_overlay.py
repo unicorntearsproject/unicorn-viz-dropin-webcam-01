@@ -1,7 +1,7 @@
 """webcam-01 — WebcamSystem subsystem drop-in.
 
 Always-on camera overlay rendered above every main effect, below the HUD.
-Provides five visual treatments that cycle with KP-/ and KP-*.
+Provides seven visual treatments that cycle with KP-/ and KP-*.
 Does not appear in the main effect playlist.
 
 Keypad controls (active at all times regardless of which effect is running):
@@ -23,6 +23,16 @@ Camera treatments:
     glitch    Chromatic aberration + scan scramble on beats
     vintage   Sepia tone, film grain, vignette
     thermal   False-colour luminance heat map
+    posterize Cel-shaded colour quantization + neon Sobel-edge outline
+    halftone  CMYK-print dot matrix, bass-reactive pitch, spinning grid
+
+PiP border (see `_border_style` / `border_style` in config.toml): 'off'
+draws nothing, 'classic' is the original flat ring, and the default
+'futuristic' is a glowing neon/HUD frame with corner-bracket accents, a
+treble-reactive scanline sweep, and organic bass/beat-reactive "drip"
+tendrils (see `_BORDER_FRAG`) -- configurable via `border_style` /
+`border_intensity` / `border_hue_speed` and always animating on its own
+(drip motion + a slow hue drift) so a long session doesn't look static.
 
 Auto-cycle (Ctrl+KP Enter) alternates normal (raw) and the next treatment
 rather than round-robining flatly through every treatment including raw:
@@ -32,9 +42,9 @@ normal -> effect -> normal -> effect -> ... An effect airs for half of
 unaffected -- it still cycles flatly through every treatment.
 
 Selfie-segmentation background cutout (optional, per-camera, off by
-default): applied before every treatment above, so raw/neon/glitch/
-vintage/thermal all get an already-processed background for free. Four
-modes -- off / dim / blur / transparent -- selected per-camera from the
+default): applied before every treatment above, so all seven treatments
+get an already-processed background for free. Four modes -- off / dim /
+blur / transparent -- selected per-camera from the
 Config Editor's Visuals tab (one 0/1/2/3 slider per detected camera), not
 from config.toml. Needs `mediapipe` (see requirements.txt) -- absent, the
 selector just does nothing. `transparent` outputs a genuine per-pixel
@@ -61,8 +71,9 @@ Editor's Visuals tab, defaulting to `_SELFIE_SEG_GROW_PX_DEFAULT` /
 """
 from __future__ import annotations
 
-__version__ = '1.4.0'
+__version__ = '1.5.0'
 
+import colorsys
 import logging
 import sys
 import threading
@@ -243,9 +254,202 @@ void main() {
     fragColor = vec4(thermalPalette(boosted), cam.a);
 }
 """,
+
+    # Cel-shaded colour quantization with a Sobel-derived neon edge
+    # outline. Bass briefly coarsens the quantization (fewer levels,
+    # bigger colour jumps) on a hit; treble speeds up and brightens the
+    # outline's hue-cycling glow.
+    'posterize': """
+#version 330
+uniform sampler2D cam_tex;
+uniform float iBass;
+uniform float iTreble;
+uniform float iTime;
+in  vec2 v_uv;
+out vec4 fragColor;
+vec3 hsvToRgb(vec3 c) {
+    vec4 K = vec4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
+    vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
+    return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
+}
+void main() {
+    vec2 texel = 1.0 / vec2(textureSize(cam_tex, 0));
+    vec4 cam = texture(cam_tex, v_uv);
+
+    float levels = mix(10.0, 4.0, clamp(iBass * 1.4, 0.0, 1.0));
+    vec3 quant = floor(cam.rgb * levels + 0.5) / levels;
+
+    float tl = dot(texture(cam_tex, v_uv + texel * vec2(-1.0, -1.0)).rgb, vec3(0.299, 0.587, 0.114));
+    float t  = dot(texture(cam_tex, v_uv + texel * vec2( 0.0, -1.0)).rgb, vec3(0.299, 0.587, 0.114));
+    float tr = dot(texture(cam_tex, v_uv + texel * vec2( 1.0, -1.0)).rgb, vec3(0.299, 0.587, 0.114));
+    float l  = dot(texture(cam_tex, v_uv + texel * vec2(-1.0,  0.0)).rgb, vec3(0.299, 0.587, 0.114));
+    float r  = dot(texture(cam_tex, v_uv + texel * vec2( 1.0,  0.0)).rgb, vec3(0.299, 0.587, 0.114));
+    float bl = dot(texture(cam_tex, v_uv + texel * vec2(-1.0,  1.0)).rgb, vec3(0.299, 0.587, 0.114));
+    float bt = dot(texture(cam_tex, v_uv + texel * vec2( 0.0,  1.0)).rgb, vec3(0.299, 0.587, 0.114));
+    float br = dot(texture(cam_tex, v_uv + texel * vec2( 1.0,  1.0)).rgb, vec3(0.299, 0.587, 0.114));
+    float gx = -tl - 2.0 * l - bl + tr + 2.0 * r + br;
+    float gy = -tl - 2.0 * t - tr + bl + 2.0 * bt + br;
+    float edge = clamp(sqrt(gx * gx + gy * gy), 0.0, 1.0);
+
+    float hue = fract(iTime * (0.05 + iTreble * 0.25));
+    vec3 edgeCol = hsvToRgb(vec3(hue, 0.85, 1.0));
+    vec3 col = mix(quant, edgeCol, edge * (0.65 + iTreble * 0.35));
+    fragColor = vec4(clamp(col, 0.0, 1.0), cam.a);
+}
+""",
+
+    # Retro CMYK-print dot-matrix halftone. Luminance is resampled per
+    # grid cell and drawn as a variable-radius dot; bass shrinks the dot
+    # pitch (denser dots) and widens each dot's radius on a hit, treble
+    # spins the grid angle, and a slow hue drift keeps a long session
+    # from reading static.
+    'halftone': """
+#version 330
+uniform sampler2D cam_tex;
+uniform float iBass;
+uniform float iTreble;
+uniform float iTime;
+in  vec2 v_uv;
+out vec4 fragColor;
+vec3 hsvToRgb(vec3 c) {
+    vec4 K = vec4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
+    vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
+    return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
+}
+void main() {
+    vec2 res = vec2(textureSize(cam_tex, 0));
+    float cellPx = max(3.0, 9.0 - iBass * 3.0);
+    float angle = 0.35 + iTreble * 0.6 + sin(iTime * 0.07) * 0.15;
+    float c = cos(angle);
+    float s = sin(angle);
+    mat2 rot = mat2(c, -s, s, c);
+
+    vec2 uvPx = v_uv * res;
+    vec2 ruv = rot * uvPx;
+    vec2 cellCenterR = (floor(ruv / cellPx) + 0.5) * cellPx;
+    vec2 cellCenterPx = transpose(rot) * cellCenterR;
+    vec2 cellCenterUv = clamp(cellCenterPx / res, 0.0, 1.0);
+
+    vec4 cell = texture(cam_tex, cellCenterUv);
+    float luma = dot(cell.rgb, vec3(0.299, 0.587, 0.114));
+    float radius = (1.0 - luma) * cellPx * 0.5 * (0.7 + iBass * 0.5);
+    float d = length(ruv - cellCenterR);
+    float dotMask = 1.0 - smoothstep(radius - 1.0, radius + 1.0, d);
+
+    float hue = fract(iTime * 0.03);
+    vec3 dotCol = hsvToRgb(vec3(hue, 0.55, 1.0));
+    vec3 col = mix(vec3(0.03, 0.03, 0.06), dotCol, dotMask);
+    fragColor = vec4(clamp(col, 0.0, 1.0), cell.a);
+}
+""",
 }
 
-_TREATMENT_NAMES: list[str] = ['raw', 'neon', 'glitch', 'vintage', 'thermal']
+_TREATMENT_NAMES: list[str] = ['raw', 'neon', 'glitch', 'vintage', 'thermal', 'posterize', 'halftone']
+
+# PiP border look: 'off' draws nothing, 'classic' is the original flat
+# scissor-clear ring (_clear_border_ring), 'futuristic' is the glowing
+# neon/HUD/drippy shader border (_draw_border_futuristic / _BORDER_FRAG).
+# See WebcamSystem._border_style and the `border_style` / `border_intensity`
+# / `border_hue_speed` config.toml keys.
+_BORDER_STYLES: tuple[str, ...] = ('off', 'classic', 'futuristic')
+
+# Fragment shader for the 'futuristic' border style: a glowing neon/HUD
+# frame around the PiP with crisp corner-bracket accents, a treble-reactive
+# scanline sweep, and organic bass/beat-reactive "drip" tendrils that
+# locally thicken the ring (heavier toward the bottom of the frame --
+# gravity -- and on a bass hit -- "sag"). The drip concept mirrors
+# banner-01's `_draw_drippy_text` (wave amplitude widens with bass, extra
+# sag on a beat hit) adapted from per-character text motion to a border
+# ring's local thickness. Interior pixels always stay fully transparent --
+# the opaque cam quad drawn right after this always redraws its own exact
+# rect on top, so any inward bulge here would be invisible anyway; drips
+# only ever grow the ring *outward* into the padding reserved for them
+# (see the `headroom` margin in _draw_border_futuristic).
+#
+# Expects: iRectPx (inner camera rect size, px), iPadPx (total quad
+# padding around that rect, px -- how far glow/drips can reach, always
+# >= 1), iBorderPx (base ring thickness within that padding, px, already
+# bass-pulsed on the CPU side), iIntensity (0-2 overall strength dial),
+# iHueBase/iHueSpeed (colour drift -- see WebcamSystem._border_hue_base),
+# iTime/iBass/iTreble. Produces the border's RGBA colour; v_uv spans the
+# OUTER padded rect, (0,0) at its top-left, (1,1) at its bottom-right
+# (image-space, matching the camera texture's own row order).
+_BORDER_FRAG = """
+#version 330
+uniform vec2  iRectPx;
+uniform float iPadPx;
+uniform float iBorderPx;
+uniform float iIntensity;
+uniform float iHueBase;
+uniform float iHueSpeed;
+uniform float iTime;
+uniform float iBass;
+uniform float iTreble;
+in  vec2 v_uv;
+out vec4 fragColor;
+
+vec3 hsvToRgb(vec3 c) {
+    vec4 K = vec4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
+    vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
+    return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
+}
+
+float hash11(float n) { return fract(sin(n) * 43758.5453123); }
+
+// Signed "outside a rect" distance: <=0 inside [innerMin, innerMax],
+// grows beyond it. Not a full rounded-box SDF -- this border is a plain
+// right-angled HUD frame, no rounding.
+float sdBoxOutside(vec2 p, vec2 innerMin, vec2 innerMax) {
+    vec2 o = max(innerMin - p, p - innerMax);
+    return max(o.x, o.y);
+}
+
+void main() {
+    vec2 outerPx  = iRectPx + vec2(iPadPx * 2.0);
+    vec2 fragPx   = v_uv * outerPx;
+    vec2 innerMin = vec2(iPadPx);
+    vec2 innerMax = iRectPx + vec2(iPadPx);
+    float dist = sdBoxOutside(fragPx, innerMin, innerMax);
+
+    // Bass-transient ("beat-ish") pulse -- this drop-in's render() only
+    // receives bass/treble (no iBeat), so a hit is approximated by
+    // thresholding iBass, the same idiom the 'glitch' treatment uses.
+    float pulse = smoothstep(0.55, 0.95, iBass);
+
+    // Organic per-column drip wobble, heavier toward the bottom (gravity)
+    // and on a bass hit (sag) -- widens the ring locally, outward only.
+    float cell = floor((fragPx.x + fragPx.y * 0.35) / 14.0);
+    float jitter = hash11(cell);
+    float phase = iTime * (0.5 + jitter * 0.9) + jitter * 6.2831;
+    float drip = pow(0.5 + 0.5 * sin(phase), 3.0);
+    float gravity = mix(0.5, 1.4, smoothstep(0.0, outerPx.y, fragPx.y));
+    float dripPx = (6.0 + iBass * 22.0 + pulse * 16.0) * iIntensity * drip * gravity;
+    float localBorder = max(0.5, min(iBorderPx + dripPx, iPadPx * 0.95));
+
+    float band = smoothstep(0.0, 2.0, dist)
+               * (1.0 - smoothstep(localBorder * 0.5, localBorder, max(dist, 0.0)));
+    float halo = (1.0 - smoothstep(localBorder, iPadPx, max(dist, 0.0))) * 0.35;
+    float glow = clamp(band + halo, 0.0, 1.0);
+
+    // HUD corner brackets -- crisp accents at the camera rect's four
+    // corners, deliberately NOT drippy (contrast against the melt).
+    float dc = min(
+        min(length(fragPx - innerMin), length(fragPx - vec2(innerMax.x, innerMin.y))),
+        min(length(fragPx - vec2(innerMin.x, innerMax.y)), length(fragPx - innerMax))
+    );
+    float bracket = (1.0 - smoothstep(0.0, iBorderPx * 2.2, dc)) * step(dist, iBorderPx * 1.6);
+
+    // Scanline sweep; treble adds sparkle density/brightness.
+    float scan = pow(max(0.0, 0.5 + 0.5 * sin(fragPx.y * 0.9 - iTime * 40.0)), 8.0) * (0.4 + iTreble * 1.2);
+
+    float hue = fract(iHueBase + iTime * iHueSpeed + fragPx.x * 0.0006 - fragPx.y * 0.0004);
+    vec3 neon = hsvToRgb(vec3(hue, 0.85, 1.0));
+
+    vec3 col = neon * (0.55 + scan * 0.6) + vec3(1.0) * bracket * 0.9;
+    float alpha = clamp((glow + bracket * 0.6) * iIntensity * (1.0 + pulse * 0.4), 0.0, 1.0);
+    fragColor = vec4(clamp(col, 0.0, 1.0), alpha);
+}
+"""
 
 
 def _feather_mask(mask: np.ndarray, grow_px: int, feather_px: int) -> np.ndarray:
@@ -599,6 +803,17 @@ class WebcamSystem:
         self._border_color = self._parse_border_color(
             cfg.get('border_color', (0.04, 0.72, 1.0, 0.28))
         )
+        # Border look: 'off' | 'classic' (original flat ring) | 'futuristic'
+        # (glowing neon/HUD/drippy shader border, see _BORDER_FRAG) --
+        # default is the new futuristic look. `border_intensity` scales the
+        # whole effect's glow/drip strength; `border_hue_speed` is how many
+        # full colour turns per second the neon hue drifts through, seeded
+        # from `border_color`'s own hue so the look still starts from the
+        # configured tint even though it's no longer static.
+        self._border_style = self._parse_border_style(cfg.get('border_style', 'futuristic'))
+        self._border_intensity = max(0.0, min(2.0, float(cfg.get('border_intensity', 1.0))))
+        self._border_hue_speed = max(0.0, min(1.0, float(cfg.get('border_hue_speed', 0.05))))
+        self._border_hue_base = self._hue_from_color(self._border_color)
         self._layout     = 'bottom_right'
         self._hidden     = False
         self._switch_hide_active = False
@@ -682,6 +897,12 @@ class WebcamSystem:
             self._cam_vao_map[name] = ctx.vertex_array(
                 prog, [(self._cam_vbo, '2f 2f', 'in_pos', 'in_uv')]
             )
+
+        self._border_prog = ctx.program(vertex_shader=_CAM_VERT, fragment_shader=_BORDER_FRAG)
+        self._border_vbo = ctx.buffer(reserve=6 * 4 * 4)
+        self._border_vao = ctx.vertex_array(
+            self._border_prog, [(self._border_vbo, '2f 2f', 'in_pos', 'in_uv')]
+        )
 
         fb = np.zeros((256, 256, 3), dtype=np.uint8)
         yy, xx = np.indices((256, 256))
@@ -977,6 +1198,23 @@ class WebcamSystem:
             floats.append(0.0 if len(floats) < 3 else 1.0)
         return tuple(max(0.0, min(1.0, v)) for v in floats[:4])
 
+    @staticmethod
+    def _parse_border_style(value: Any) -> str:
+        """Accept a border style name; anything unrecognized falls back to
+        'futuristic' (the redesigned default look), not 'off'/'classic' --
+        an unrecognized config value should not silently disable the
+        border, it should fall back to the intended new default."""
+        text = str(value).strip().lower()
+        return text if text in _BORDER_STYLES else 'futuristic'
+
+    @staticmethod
+    def _hue_from_color(color: tuple[float, float, float, float]) -> float:
+        """Extract the hue (0-1) from an RGBA border colour -- the
+        futuristic border's starting hue before `border_hue_speed` drifts
+        it over time."""
+        hue, _saturation, _value = colorsys.rgb_to_hsv(color[0], color[1], color[2])
+        return float(hue)
+
     def next_treatment(self) -> str:
         self._treatment_index = (self._treatment_index + 1) % len(_TREATMENT_NAMES)
         return _TREATMENT_NAMES[self._treatment_index]
@@ -1225,6 +1463,13 @@ class WebcamSystem:
     _SELFIE_SEG_FEATHER_SETTING = 'selfie_seg_feather_px'
     _SELFIE_SEG_BLUR_SETTING = 'selfie_seg_blur_px'
     _SELFIE_SEG_TEMPORAL_SETTING = 'selfie_seg_temporal'
+    # Border look: same "no native dropdown, ride a stepped slider"
+    # convention as the selfie-seg mode selector above. Style is a 0-2
+    # stepped slider (off/classic/futuristic); intensity and hue-cycle
+    # speed are continuous global sliders.
+    _BORDER_STYLE_SETTING = 'border_style'
+    _BORDER_INTENSITY_SETTING = 'border_intensity'
+    _BORDER_HUE_SPEED_SETTING = 'border_hue_speed'
 
     def config_editor_settings(self) -> list[dict[str, float | str]]:
         # Union _available_cameras with anything already known in memory
@@ -1269,6 +1514,19 @@ class WebcamSystem:
             'name': self._SELFIE_SEG_TEMPORAL_SETTING, 'value': float(self._selfie_seg_temporal),
             'min': 0.0, 'max': 0.95,
         })
+        settings.append({
+            'name': self._BORDER_STYLE_SETTING,
+            'value': float(_BORDER_STYLES.index(self._border_style)),
+            'min': 0.0, 'max': float(len(_BORDER_STYLES) - 1), 'step': 1.0,
+        })
+        settings.append({
+            'name': self._BORDER_INTENSITY_SETTING, 'value': float(self._border_intensity),
+            'min': 0.0, 'max': 2.0,
+        })
+        settings.append({
+            'name': self._BORDER_HUE_SPEED_SETTING, 'value': float(self._border_hue_speed),
+            'min': 0.0, 'max': 1.0,
+        })
         return settings
 
     def set_config_setting(self, name: str, value: float) -> None:
@@ -1287,6 +1545,16 @@ class WebcamSystem:
         if name == self._SELFIE_SEG_TEMPORAL_SETTING:
             self._selfie_seg_temporal = max(0.0, min(0.95, float(value)))
             self._push_selfie_seg_tuning()
+            return
+        if name == self._BORDER_STYLE_SETTING:
+            index = max(0, min(len(_BORDER_STYLES) - 1, int(round(value))))
+            self._border_style = _BORDER_STYLES[index]
+            return
+        if name == self._BORDER_INTENSITY_SETTING:
+            self._border_intensity = max(0.0, min(2.0, float(value)))
+            return
+        if name == self._BORDER_HUE_SPEED_SETTING:
+            self._border_hue_speed = max(0.0, min(1.0, float(value)))
             return
         prefix, suffix = self._SELFIE_SEG_SETTING_PREFIX, self._SELFIE_SEG_SETTING_SUFFIX
         if not (name.startswith(prefix) and name.endswith(suffix)):
@@ -1500,6 +1768,33 @@ class WebcamSystem:
             self._ctx.clear(*self._border_color)
         self._ctx.scissor = None
 
+    def _draw_border_futuristic(self, x: float, y: float, w: float, h: float,
+                                 bass: float, treble: float) -> None:
+        """Render the glowing neon/HUD/drippy border via `_BORDER_FRAG`.
+
+        Ring thickness pulses with bass exactly like the classic border
+        did; a `headroom` margin is added on top so the shader's organic
+        drip tendrils (see `_BORDER_FRAG`) have room to bulge outward
+        without clipping at the quad's own edge. Drawn before the cam
+        quad, with fully transparent interior pixels, so the opaque cam
+        quad drawn right after this shows through unobstructed.
+        """
+        b = self._border_thickness + bass * (self._border_thickness * 0.75)
+        headroom = 26.0 * self._border_intensity
+        pad = max(1.0, b + headroom)
+        self._write_border_quad(x, y, w, h, pad)
+        prog = self._border_prog
+        prog['iRectPx'].value = (w, h)
+        prog['iPadPx'].value = pad
+        prog['iBorderPx'].value = b
+        prog['iIntensity'].value = self._border_intensity
+        prog['iHueBase'].value = self._border_hue_base
+        prog['iHueSpeed'].value = self._border_hue_speed
+        prog['iTime'].value = self._time
+        prog['iBass'].value = bass
+        prog['iTreble'].value = treble
+        self._border_vao.render(moderngl.TRIANGLES)
+
     def render(self, dt: float, bass: float, treble: float) -> None:
         if self._switch_hide_active and time.monotonic() >= self._switch_hide_deadline:
             self._switch_hide_active = False
@@ -1516,8 +1811,12 @@ class WebcamSystem:
         # No backplate in 'transparent' mode -- a cutout floating over the
         # show reads wrong with a coloured frame boxing it in.
         if self._selfie_seg != 'transparent':
-            b = self._border_thickness + bass * (self._border_thickness * 0.75)
-            self._clear_border_ring(x, y, w, h, b)
+            if self._border_style == 'classic':
+                b = self._border_thickness + bass * (self._border_thickness * 0.75)
+                self._clear_border_ring(x, y, w, h, b)
+            elif self._border_style == 'futuristic':
+                self._draw_border_futuristic(x, y, w, h, bass, treble)
+            # 'off' draws nothing.
 
         self._write_cam_quad(x, y, w, h)
         tex.use(location=0)
@@ -1608,7 +1907,14 @@ class WebcamSystem:
 
         return x, y, w, h
 
-    def _write_cam_quad(self, x: float, y: float, w: float, h: float) -> None:
+    def _quad_verts(self, x: float, y: float, w: float, h: float) -> np.ndarray:
+        """Build a two-triangle fullscreen-quad vertex buffer for the rect
+        ``(x, y, w, h)`` in viewport pixel space (origin top-left), with
+        ``in_uv`` in [0,1]^2 -- uv (0,0) at the rect's top-left, matching
+        the camera texture's own row order. Shared by `_write_cam_quad`
+        and `_write_border_quad` so the two quads (camera image, border
+        ring) always use identical pixel-to-clip-space math.
+        """
         def px(v: float) -> float:
             return (v / self._width) * 2.0 - 1.0
         def py(v: float) -> float:
@@ -1617,7 +1923,7 @@ class WebcamSystem:
         x0, x1 = px(x), px(x + w)
         y0, y1 = py(y), py(y + h)
 
-        verts = np.array([
+        return np.array([
             x0, y0, 0.0, 0.0,
             x1, y0, 1.0, 0.0,
             x0, y1, 0.0, 1.0,
@@ -1625,7 +1931,16 @@ class WebcamSystem:
             x1, y1, 1.0, 1.0,
             x0, y1, 0.0, 1.0,
         ], dtype=np.float32)
-        self._cam_vbo.write(verts)
+
+    def _write_cam_quad(self, x: float, y: float, w: float, h: float) -> None:
+        self._cam_vbo.write(self._quad_verts(x, y, w, h))
+
+    def _write_border_quad(self, x: float, y: float, w: float, h: float, pad: float) -> None:
+        """Write the border ring's quad: the camera rect grown by ``pad``
+        px on every side, so the border shader has room to render its
+        glow/halo/drip tendrils around the (untouched) inner camera rect.
+        """
+        self._border_vbo.write(self._quad_verts(x - pad, y - pad, w + 2.0 * pad, h + 2.0 * pad))
 
     def destroy(self) -> None:
         if self._worker is not None:
@@ -1637,6 +1952,9 @@ class WebcamSystem:
         self._cam_vbo.release()
         for prog in self._programs.values():
             prog.release()
+        self._border_vao.release()
+        self._border_vbo.release()
+        self._border_prog.release()
         self._fallback_tex.release()
         if self._cam_tex is not None:
             self._cam_tex.release()
