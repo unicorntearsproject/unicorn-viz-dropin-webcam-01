@@ -71,7 +71,7 @@ Editor's Visuals tab, defaulting to `_SELFIE_SEG_GROW_PX_DEFAULT` /
 """
 from __future__ import annotations
 
-__version__ = '1.5.1'
+__version__ = '1.5.2'
 
 import colorsys
 import logging
@@ -2045,6 +2045,14 @@ class WebcamSystem:
         self._border_vbo.write(self._quad_verts(x - pad, y - pad, w + 2.0 * pad, h + 2.0 * pad))
 
     def destroy(self) -> None:
+        # Drop the Control Room panel first so a mid-session teardown never
+        # leaves a dead panel behind (operator_panels.py "Lifecycle").
+        unregister = getattr(self._vj_api, 'unregister_operator_panel', None)
+        if callable(unregister):
+            try:
+                unregister('webcam')
+            except Exception:
+                pass
         if self._worker is not None:
             self._worker.stop()
             self._worker.join(timeout=2.0)

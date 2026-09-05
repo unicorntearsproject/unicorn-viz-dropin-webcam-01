@@ -54,6 +54,9 @@ class _FakeVJApi:
     def register_operator_panel(self, panel: OperatorPanel) -> None:
         self.panels[panel.name] = panel
 
+    def unregister_operator_panel(self, name: str) -> bool:
+        return self.panels.pop(name, None) is not None
+
 
 def test_registration_call_registers_an_operator_panel() -> None:
     s = _system()
@@ -147,3 +150,32 @@ def test_action_flip_reports_new_state() -> None:
 def test_action_unknown_returns_none() -> None:
     s = _system()
     assert s._operator_panel_action('bogus', None) is None
+
+
+class _Releasable:
+    def __init__(self) -> None:
+        self.released = False
+
+    def release(self) -> None:
+        self.released = True
+
+
+def test_destroy_unregisters_the_operator_panel() -> None:
+    """operator_panels.py "Lifecycle": a mid-session teardown must not leave
+    a dead panel (error box) behind in the Control Room."""
+    s = _system()
+    api = _FakeVJApi()
+    s.set_vj_api(api)
+    assert 'webcam' in api.panels
+    s._worker = None
+    s._cam_vao_map = {}
+    s._cam_vbo = _Releasable()
+    s._programs = {}
+    s._border_vao = _Releasable()
+    s._border_vbo = _Releasable()
+    s._border_prog = _Releasable()
+    s._fallback_tex = _Releasable()
+    s._cam_tex = None
+    s.destroy()
+    assert 'webcam' not in api.panels
+    assert s._border_prog.released and s._fallback_tex.released

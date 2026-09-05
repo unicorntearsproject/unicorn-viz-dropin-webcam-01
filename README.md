@@ -1,6 +1,6 @@
 # webcam-01 — Webcam Overlay
 
-**Version 1.5.1**
+**Version 1.5.2**
 
 A drop-in for [unicorn-viz](https://github.com/iDoMeteor/unicorn-viz).
 
@@ -250,6 +250,7 @@ help overlay. `Alt+[` / `Alt+]` also resize the PiP as an alias for
 
 ## Changelog
 
+- **1.5.2** — Control Room panel is unregistered in `destroy()` so a mid-session teardown never leaves a dead panel (error box) behind — the `operator_panels.py` lifecycle rule from `docs/planning/control-room-drop-in-integration-plan-2026-09-05.md`.
 - **1.5.1** — **Control Room panel, P2 of
   `docs/planning/control-room-panel-registry-plan-2026-09-04.md`.**
   Registers a declarative `Webcam` panel via
