@@ -71,7 +71,7 @@ Editor's Visuals tab, defaulting to `_SELFIE_SEG_GROW_PX_DEFAULT` /
 """
 from __future__ import annotations
 
-__version__ = '1.5.0'
+__version__ = '1.5.1'
 
 import colorsys
 import logging
@@ -947,6 +947,43 @@ class WebcamSystem:
             import logging  # noqa: PLC0415
             logging.getLogger(__name__).debug('webcam-01: MIDI registration failed: %s', exc)
 
+        # Control Room panel (docs/planning/control-room-panel-registry-plan-
+        # 2026-09-04.md, P2): registers real state instead of the old
+        # hardcoded CR panel, which always drew full controls against
+        # vj_api.list_webcam_cameras()/webcam_image_state() -- even with no
+        # webcam-01 loaded and nothing behind them. Individual per-device
+        # select/enable chips (capped at 2 devices in the old panel) are not
+        # carried forward: the declarative button row is single-row-only,
+        # and PREV/NEXT + REDISC already cover cycling through and
+        # refreshing every detected camera. Deferred import + try/except so
+        # a core without the registry just gets no panel, never a crash.
+        try:
+            from unicornviz.operator_panels import (  # noqa: PLC0415
+                OperatorPanel,
+            )
+            api.register_operator_panel(OperatorPanel(
+                name='webcam',
+                title='Webcam',
+                priority=50,
+                size='full',
+                content=self._operator_panel_content,
+                on_action=self._operator_panel_action,
+                tooltips={
+                    'prev_camera': 'Switch to the previous detected camera',
+                    'next_camera': 'Switch to the next detected camera',
+                    'rediscover': 'Re-scan for connected cameras',
+                    'brightness_down': 'Decrease webcam brightness',
+                    'brightness_up': 'Increase webcam brightness',
+                    'contrast_down': 'Decrease webcam contrast',
+                    'contrast_up': 'Increase webcam contrast',
+                    'flip_h': 'Mirror the webcam image horizontally',
+                    'flip_v': 'Mirror the webcam image vertically',
+                },
+            ))
+        except Exception as exc:
+            import logging  # noqa: PLC0415
+            logging.getLogger(__name__).debug('webcam-01: operator panel registration failed: %s', exc)
+
     def _midi_toggle(self) -> None:
         """MIDI handler: toggle webcam overlay on/off."""
         self.enabled = not self.enabled
@@ -1657,6 +1694,71 @@ class WebcamSystem:
             'switching': switching,
             'switch_hide_remaining_s': float(remaining_s),
         }
+
+    def _operator_panel_content(self) -> Any:
+        """Build the Control Room panel's live state (see registration above).
+
+        Runs on the Control Room's render thread; reads only, via the same
+        list_cameras()/webcam_image_state() every other integration uses.
+        """
+        from unicornviz.operator_panels import (  # noqa: PLC0415
+            PanelButton, PanelContent, PanelRow,
+        )
+        devices = self.list_cameras()
+        selected = next((d for d in devices if bool(d.get('selected', False))), None)
+        selected_label = str(selected.get('label', '-')) if selected is not None else '-'
+        img_state = self.webcam_image_state()
+        brightness = float(img_state.get('brightness', 1.0) or 1.0)
+        contrast = float(img_state.get('contrast', 1.0) or 1.0)
+        switching = bool(img_state.get('switching', False))
+
+        rows = [PanelRow('Active', selected_label)]
+        if switching:
+            remaining = float(img_state.get('switch_hide_remaining_s', 0.0) or 0.0)
+            rows.append(PanelRow('Switching', f'{remaining:.1f}s', emphasis='warn'))
+        else:
+            rows.append(PanelRow('B / C', f'{brightness:.2f} / {contrast:.2f}'))
+
+        return PanelContent(
+            status='ON' if self.enabled else 'OFF',
+            rows=tuple(rows),
+            buttons=(
+                PanelButton('prev_camera', 'PREV'),
+                PanelButton('next_camera', 'NEXT'),
+                PanelButton('rediscover', 'REDISC'),
+                PanelButton('brightness_down', 'B-'),
+                PanelButton('brightness_up', 'B+'),
+                PanelButton('contrast_down', 'C-'),
+                PanelButton('contrast_up', 'C+'),
+                PanelButton('flip_h', 'FLIP H', active=bool(img_state.get('flip_horizontal', False)), accent='accent_2'),
+                PanelButton('flip_v', 'FLIP V', active=bool(img_state.get('flip_vertical', False)), accent='accent_2'),
+            ),
+        )
+
+    def _operator_panel_action(self, action: str, _payload: Any) -> str | None:
+        """Handle a Control Room panel button; see registration above."""
+        if action == 'prev_camera':
+            label = self.prev_camera()
+            return f'Camera: {label}' if label else 'Camera: only one device'
+        if action == 'next_camera':
+            label = self.next_camera()
+            return f'Camera: {label}' if label else 'Camera: only one device'
+        if action == 'rediscover':
+            devices = self.rediscover_cameras()
+            return f'Webcam rediscover: {len(devices)} found'
+        if action == 'brightness_down':
+            return f'Webcam brightness {self.adjust_brightness(-0.05):.2f}'
+        if action == 'brightness_up':
+            return f'Webcam brightness {self.adjust_brightness(0.05):.2f}'
+        if action == 'contrast_down':
+            return f'Webcam contrast {self.adjust_contrast(-0.05):.2f}'
+        if action == 'contrast_up':
+            return f'Webcam contrast {self.adjust_contrast(0.05):.2f}'
+        if action == 'flip_h':
+            return f'Webcam flip H: {"ON" if self.toggle_flip_horizontal() else "OFF"}'
+        if action == 'flip_v':
+            return f'Webcam flip V: {"ON" if self.toggle_flip_vertical() else "OFF"}'
+        return None
 
     def _restart_worker(self) -> None:
         """Start capture worker if needed, or request in-thread device switch."""

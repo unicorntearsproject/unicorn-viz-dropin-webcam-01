@@ -1,6 +1,6 @@
 # webcam-01 — Webcam Overlay
 
-**Version 1.5.0**
+**Version 1.5.1**
 
 A drop-in for [unicorn-viz](https://github.com/iDoMeteor/unicorn-viz).
 
@@ -250,6 +250,19 @@ help overlay. `Alt+[` / `Alt+]` also resize the PiP as an alias for
 
 ## Changelog
 
+- **1.5.1** — **Control Room panel, P2 of
+  `docs/planning/control-room-panel-registry-plan-2026-09-04.md`.**
+  Registers a declarative `Webcam` panel via
+  `vj_api.register_operator_panel()` (guarded, degrades to no panel on
+  an older core), replacing Control Room's hardcoded panel, which always
+  drew full controls even with webcam-01 not loaded. The panel shows
+  active camera + brightness/contrast (or a switching countdown), and
+  PREV/NEXT/REDISC/B±/C±/FLIP H/FLIP V buttons wired to the existing
+  camera and image-control methods, unchanged. Per-device select/enable
+  chips (capped at 2 devices in the old panel) are not carried forward —
+  the declarative button row is single-row-only, and PREV/NEXT/REDISC
+  already cover cycling through and refreshing every detected camera.
+  11 new tests.
 - **1.4.0** — Temporal smoothing for the selfie-seg matte: the raw
   per-frame confidence mask now blends toward the previous frame's raw
   mask (`selfie_seg_temporal`, default 0.5, new global live slider)
