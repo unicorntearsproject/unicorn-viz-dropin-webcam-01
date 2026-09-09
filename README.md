@@ -1,6 +1,6 @@
 # webcam-01 — Webcam Overlay
 
-**Version 1.5.2**
+**Version 1.5.3**
 
 A drop-in for [unicorn-viz](https://github.com/iDoMeteor/unicorn-viz).
 
@@ -201,7 +201,7 @@ device            = 0              # /dev/video index (Linux) or DirectShow inde
 width             = 1280
 height            = 720
 fps               = 30
-pip_position      = "bottom_right" # top_left | top_center | top_right |
+pip_position      = "hidden"       # top_left | top_center | top_right |
                                     # left | center | right |
                                     # bottom_left | bottom_center | bottom_right |
                                     # fullscreen | hidden
@@ -250,6 +250,12 @@ help overlay. `Alt+[` / `Alt+]` also resize the PiP as an alias for
 
 ## Changelog
 
+- **1.5.3** — the *code* default for `pip_position` is now `"hidden"`, matching
+  what the README and the privacy comments have called the shipped default
+  since rc.2. It was still `"bottom_right"`, so a config without a `[webcam]`
+  section (the bare-bones `config.dist.toml` the installers seed) probed and
+  opened every camera at boot — 90 s of black screen on the first Windows
+  beta run (three cameras through Media Foundation).
 - **1.5.2** — Control Room panel is unregistered in `destroy()` so a mid-session teardown never leaves a dead panel (error box) behind — the `operator_panels.py` lifecycle rule from `docs/planning/control-room-drop-in-integration-plan-2026-09-05.md`.
 - **1.5.1** — **Control Room panel, P2 of
   `docs/planning/control-room-panel-registry-plan-2026-09-04.md`.**

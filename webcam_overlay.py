@@ -71,7 +71,7 @@ Editor's Visuals tab, defaulting to `_SELFIE_SEG_GROW_PX_DEFAULT` /
 """
 from __future__ import annotations
 
-__version__ = '1.5.2'
+__version__ = '1.5.3'
 
 import colorsys
 import logging
@@ -827,7 +827,7 @@ class WebcamSystem:
         # constructor -- which the core's guarded loader swallowed, silently
         # disabling the whole drop-in (regression in 1.0.0-rc.2).
         self._layout, self._hidden = self._resolve_layout_token(
-            str(cfg.get('pip_position', 'bottom_right')).lower(), self._layout)
+            str(cfg.get('pip_position', 'hidden')).lower(), self._layout)
 
         default_treatment = str(cfg.get('treatment', 'neon')).lower()
         if default_treatment not in _TREATMENT_NAMES:
