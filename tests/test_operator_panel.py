@@ -15,6 +15,8 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import webcam_overlay as wo  # noqa: E402
@@ -63,7 +65,7 @@ def test_registration_call_registers_an_operator_panel() -> None:
     api = _FakeVJApi()
     s.set_vj_api(api)
     panel = api.panels['webcam']
-    assert panel.title == 'Webcam' and panel.page == 'main' and panel.size == 'full'
+    assert panel.title == 'Webcam' and panel.page == 'overlays' and panel.size == 'full'
     assert panel.content == s._operator_panel_content
     assert panel.on_action == s._operator_panel_action
     assert panel.tooltips['prev_camera'] == 'Switch to the previous detected camera'
@@ -77,18 +79,44 @@ def test_content_reflects_active_camera_and_brightness_contrast() -> None:
     by_label = {row.label: row.value for row in content.rows}
     expected_label = '/dev/video0' if sys.platform != 'win32' else '0'
     assert by_label['Active'] == expected_label
-    assert by_label['B / C'] == '1.25 / 0.75'
+    assert by_label['Devices'] == '1 detected, 1 enabled'
     assert 'Switching' not in by_label
+    meters = {m.label: m for m in content.meters}
+    assert meters['Brightness'].text == '1.25'
+    assert meters['Contrast'].text == '0.75'
+    # normalized against the real [0.2, 2.0] clamp range set_brightness()/
+    # set_contrast() enforce, not an arbitrary 0..1 reading of the raw value.
+    assert meters['Brightness'].value == pytest.approx((1.25 - 0.2) / 1.8)
+    assert meters['Contrast'].value == pytest.approx((0.75 - 0.2) / 1.8)
 
 
-def test_content_shows_switching_instead_of_brightness_contrast() -> None:
+def test_content_meters_clamp_to_0_1_at_the_real_value_extremes() -> None:
+    s = _system(_brightness=0.2, _contrast=2.0)
+    content = s._operator_panel_content()
+    meters = {m.label: m for m in content.meters}
+    assert meters['Brightness'].value == pytest.approx(0.0)
+    assert meters['Contrast'].value == pytest.approx(1.0)
+
+
+def test_content_devices_row_reflects_disabled_cameras() -> None:
+    s = _system(
+        _detected_cameras=[0, 1], _available_cameras=[0, 1], _disabled_cameras={1},
+    )
+    content = s._operator_panel_content()
+    by_label = {row.label: row.value for row in content.rows}
+    assert by_label['Devices'] == '2 detected, 1 enabled'
+
+
+def test_content_shows_switching_instead_of_devices() -> None:
     s = _system(_switch_hide_active=True, _switch_hide_deadline=time.monotonic() + 0.4)
     content = s._operator_panel_content()
     by_label = {row.label: row.value for row in content.rows}
     assert 'Switching' in by_label
-    assert 'B / C' not in by_label
+    assert 'Devices' not in by_label
     switching_row = next(r for r in content.rows if r.label == 'Switching')
     assert switching_row.emphasis == 'warn'
+    # Brightness/contrast meters keep showing regardless of the switching row.
+    assert {m.label for m in content.meters} == {'Brightness', 'Contrast'}
 
 
 def test_content_active_dash_with_no_cameras() -> None:

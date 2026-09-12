@@ -1,6 +1,6 @@
 # webcam-01 — Webcam Overlay
 
-**Version 1.5.3**
+**Version 1.5.4**
 
 A drop-in for [unicorn-viz](https://github.com/iDoMeteor/unicorn-viz).
 
@@ -250,6 +250,17 @@ help overlay. `Alt+[` / `Alt+]` also resize the PiP as an alias for
 
 ## Changelog
 
+- **1.5.4** — Moved the Control Room panel to the shared `overlays` page
+  (was `main`), where it belongs alongside banner/chat/lyrics per
+  `docs/planning/control-room-drop-in-integration-plan-2026-09-05.md`
+  section 3.7 — and where it fixes a real regression: once several
+  drop-ins were registering panels on `main`, the band there was only
+  ever sized for one row (see control-room-01's own changelog), so the
+  webcam panel silently stopped rendering at all. Also polishes the
+  panel now that it has real room: brightness/contrast are `PanelMeter`
+  bars (normalized against the actual `[0.2, 2.0]` clamp range) instead
+  of a plain text row, and a new `Devices` row reports detected/enabled
+  camera counts. 4 new tests.
 - **1.5.3** — the *code* default for `pip_position` is now `"hidden"`, matching
   what the README and the privacy comments have called the shipped default
   since rc.2. It was still `"bottom_right"`, so a config without a `[webcam]`

@@ -71,7 +71,7 @@ Editor's Visuals tab, defaulting to `_SELFIE_SEG_GROW_PX_DEFAULT` /
 """
 from __future__ import annotations
 
-__version__ = '1.5.3'
+__version__ = '1.5.4'
 
 import colorsys
 import logging
@@ -948,7 +948,10 @@ class WebcamSystem:
             logging.getLogger(__name__).debug('webcam-01: MIDI registration failed: %s', exc)
 
         # Control Room panel (docs/planning/control-room-panel-registry-plan-
-        # 2026-09-04.md, P2): registers real state instead of the old
+        # 2026-09-04.md, P2; moved to the shared 'overlays' page 2026-09-12
+        # per docs/planning/control-room-drop-in-integration-plan-2026-09-05
+        # .md section 3.7 -- webcam is a camera overlay, same bucket as
+        # banner/chat/lyrics). Registers real state instead of the old
         # hardcoded CR panel, which always drew full controls against
         # vj_api.list_webcam_cameras()/webcam_image_state() -- even with no
         # webcam-01 loaded and nothing behind them. Individual per-device
@@ -964,6 +967,7 @@ class WebcamSystem:
             api.register_operator_panel(OperatorPanel(
                 name='webcam',
                 title='Webcam',
+                page='overlays',
                 priority=50,
                 size='full',
                 content=self._operator_panel_content,
@@ -1702,7 +1706,7 @@ class WebcamSystem:
         list_cameras()/webcam_image_state() every other integration uses.
         """
         from unicornviz.operator_panels import (  # noqa: PLC0415
-            PanelButton, PanelContent, PanelRow,
+            PanelButton, PanelContent, PanelMeter, PanelRow,
         )
         devices = self.list_cameras()
         selected = next((d for d in devices if bool(d.get('selected', False))), None)
@@ -1717,11 +1721,21 @@ class WebcamSystem:
             remaining = float(img_state.get('switch_hide_remaining_s', 0.0) or 0.0)
             rows.append(PanelRow('Switching', f'{remaining:.1f}s', emphasis='warn'))
         else:
-            rows.append(PanelRow('B / C', f'{brightness:.2f} / {contrast:.2f}'))
+            enabled_count = sum(1 for d in devices if bool(d.get('enabled', True)))
+            rows.append(PanelRow('Devices', f'{len(devices)} detected, {enabled_count} enabled'))
+
+        # set_brightness()/set_contrast() clamp to [0.2, 2.0]; normalize that
+        # range to 0..1 for the meter bar, keep the raw value as the readout.
+        def _norm(value: float) -> float:
+            return max(0.0, min(1.0, (value - 0.2) / 1.8))
 
         return PanelContent(
             status='ON' if self.enabled else 'OFF',
             rows=tuple(rows),
+            meters=(
+                PanelMeter('Brightness', _norm(brightness), f'{brightness:.2f}'),
+                PanelMeter('Contrast', _norm(contrast), f'{contrast:.2f}'),
+            ),
             buttons=(
                 PanelButton('prev_camera', 'PREV'),
                 PanelButton('next_camera', 'NEXT'),
