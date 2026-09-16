@@ -273,6 +273,10 @@ def _config_system() -> 'wo.WebcamSystem':
     s._border_style = 'futuristic'
     s._border_intensity = 1.0
     s._border_hue_speed = 0.05
+    s._cam_fps = 30
+    s._cam_width = 1280
+    s._cam_height = 720
+    s._auto_cycle_interval = 30.0
     return s
 
 
@@ -282,7 +286,7 @@ def test_config_editor_settings_includes_border_rows() -> None:
     names = [row['name'] for row in settings]
     assert names[-3:] == ['border_style', 'border_intensity', 'border_hue_speed']
     style_row = settings[-3]
-    assert style_row == {
+    assert {k: style_row[k] for k in ('name', 'value', 'min', 'max', 'step')} == {
         'name': 'border_style', 'value': float(wo._BORDER_STYLES.index('futuristic')),
         'min': 0.0, 'max': float(len(wo._BORDER_STYLES) - 1), 'step': 1.0,
     }

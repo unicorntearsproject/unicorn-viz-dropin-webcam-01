@@ -1,6 +1,6 @@
 # webcam-01 — Webcam Overlay
 
-**Version 1.5.4**
+**Version 1.6.0**
 
 A drop-in for [unicorn-viz](https://github.com/iDoMeteor/unicorn-viz).
 
@@ -250,6 +250,7 @@ help overlay. `Alt+[` / `Alt+]` also resize the PiP as an alias for
 
 ## Changelog
 
+- **1.6.0** — Config editor 2.0 rows: segmentation mode per camera and the matte radii move to the Performance tab as labeled choice/slider rows; new capture rate and capture size rows (next launch) and a treatment-cycle row (live) join them. Border rows keep Visuals with proper labels.
 - **1.5.4** — Moved the Control Room panel to the shared `overlays` page
   (was `main`), where it belongs alongside banner/chat/lyrics per
   `docs/planning/control-room-drop-in-integration-plan-2026-09-05.md`

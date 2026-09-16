@@ -71,7 +71,7 @@ Editor's Visuals tab, defaulting to `_SELFIE_SEG_GROW_PX_DEFAULT` /
 """
 from __future__ import annotations
 
-__version__ = '1.5.4'
+__version__ = '1.6.0'
 
 import colorsys
 import logging
@@ -1498,6 +1498,9 @@ class WebcamSystem:
     # per-camera), since they shape how the matte looks and behaves rather
     # than which camera wants segmentation.
     CONFIG_EDITOR_CATEGORY = 'Visuals'
+    CONFIG_EDITOR_TITLE = 'Webcam'
+    _CAPTURE_FPS_CHOICES = (15, 24, 30, 60)
+    _CAPTURE_SIZE_CHOICES = ((640, 360), (1280, 720), (1920, 1080))
     _SELFIE_SEG_SETTING_PREFIX = 'cam'
     _SELFIE_SEG_SETTING_SUFFIX = '_selfie_seg'
     _SELFIE_SEG_GROW_SETTING = 'selfie_seg_grow_px'
@@ -1528,6 +1531,10 @@ class WebcamSystem:
             mode = mode if mode in _SELFIE_SEG_MODES else 'off'
             settings.append({
                 'name': f'{self._SELFIE_SEG_SETTING_PREFIX}{dev}{self._SELFIE_SEG_SETTING_SUFFIX}',
+                'label': f'Camera {dev} segmentation', 'tab': 'Performance',
+                'kind': 'choice', 'choices': tuple(m.upper() for m in _SELFIE_SEG_MODES),
+                'section': 'Webcam segmentation',
+                'hint': 'Background cutout runs a segmenter per frame: the heaviest CPU cost here',
                 'value': float(_SELFIE_SEG_MODES.index(mode)),
                 'min': 0.0,
                 'max': float(len(_SELFIE_SEG_MODES) - 1),
@@ -1537,40 +1544,86 @@ class WebcamSystem:
                 # through.
                 'step': 1.0,
             })
+        seg = {'tab': 'Performance', 'section': 'Webcam segmentation'}
         settings.append({
-            'name': self._SELFIE_SEG_GROW_SETTING, 'value': float(self._selfie_seg_grow_px),
-            'min': 0.0, 'max': 20.0, 'step': 1.0,
+            'name': self._SELFIE_SEG_GROW_SETTING, 'label': 'Matte grow',
+            'value': float(self._selfie_seg_grow_px), 'min': 0.0, 'max': 20.0, 'step': 1.0,
+            'display': f'{self._selfie_seg_grow_px} px',
+            'hint': 'Pixels the kept region grows past its edge', **seg,
         })
         settings.append({
-            'name': self._SELFIE_SEG_FEATHER_SETTING, 'value': float(self._selfie_seg_feather_px),
-            'min': 0.0, 'max': 30.0, 'step': 1.0,
+            'name': self._SELFIE_SEG_FEATHER_SETTING, 'label': 'Matte feather',
+            'value': float(self._selfie_seg_feather_px), 'min': 0.0, 'max': 30.0, 'step': 1.0,
+            'display': f'{self._selfie_seg_feather_px} px',
+            'hint': 'Blur radius on the matte edge; bigger costs more', **seg,
         })
         settings.append({
-            'name': self._SELFIE_SEG_BLUR_SETTING, 'value': float(self._selfie_seg_blur_px),
-            'min': 0.0, 'max': 100.0, 'step': 1.0,
+            'name': self._SELFIE_SEG_BLUR_SETTING, 'label': 'Background blur',
+            'value': float(self._selfie_seg_blur_px), 'min': 0.0, 'max': 100.0, 'step': 1.0,
+            'display': f'{self._selfie_seg_blur_px} px',
+            'hint': 'Blur radius in blur mode; the full frame is filtered', **seg,
         })
         settings.append({
             # Continuous 0-0.95 -- how much of the previous frame's raw
             # mask carries forward; higher = smoother but laggier.
-            'name': self._SELFIE_SEG_TEMPORAL_SETTING, 'value': float(self._selfie_seg_temporal),
-            'min': 0.0, 'max': 0.95,
+            'name': self._SELFIE_SEG_TEMPORAL_SETTING, 'label': 'Matte smoothing',
+            'value': float(self._selfie_seg_temporal), 'min': 0.0, 'max': 0.95,
+            'display': f'{self._selfie_seg_temporal:.2f}',
+            'hint': 'Previous-frame mask carried forward; smoother but laggier', **seg,
+        })
+        # Capture cost: the device is opened at the configured size/rate, so
+        # these apply at the next launch (core lays them over [webcam]).
+        cap = {'tab': 'Performance', 'section': 'Webcam capture'}
+        fps_idx = min(range(len(self._CAPTURE_FPS_CHOICES)),
+                      key=lambda i: abs(self._CAPTURE_FPS_CHOICES[i] - int(self._cam_fps)))
+        size_idx = min(range(len(self._CAPTURE_SIZE_CHOICES)),
+                       key=lambda i: abs(self._CAPTURE_SIZE_CHOICES[i][0] - int(self._cam_width)))
+        settings.append({
+            'name': 'capture_fps', 'label': 'Capture rate', 'kind': 'choice',
+            'choices': tuple(str(c) for c in self._CAPTURE_FPS_CHOICES), 'value': fps_idx,
+            'restart': 'webcam', 'hint': 'Frames per second requested from the camera', **cap,
         })
         settings.append({
-            'name': self._BORDER_STYLE_SETTING,
+            'name': 'capture_size', 'label': 'Capture size', 'kind': 'choice',
+            'choices': tuple(f'{w}x{h}' for w, h in self._CAPTURE_SIZE_CHOICES), 'value': size_idx,
+            'restart': 'webcam', 'hint': 'Frame size requested from the camera', **cap,
+        })
+        settings.append({
+            'name': 'cycle_interval', 'label': 'Treatment cycle',
+            'value': float(self._auto_cycle_interval), 'min': 5.0, 'max': 120.0,
+            'display': f'{self._auto_cycle_interval:.0f} s',
+            'hint': 'Seconds per raw/effect alternation while auto-cycling', **cap,
+        })
+        settings.append({
+            'name': self._BORDER_STYLE_SETTING, 'label': 'Border style', 'kind': 'choice',
+            'choices': tuple(b.upper() for b in _BORDER_STYLES),
             'value': float(_BORDER_STYLES.index(self._border_style)),
             'min': 0.0, 'max': float(len(_BORDER_STYLES) - 1), 'step': 1.0,
         })
         settings.append({
-            'name': self._BORDER_INTENSITY_SETTING, 'value': float(self._border_intensity),
-            'min': 0.0, 'max': 2.0,
+            'name': self._BORDER_INTENSITY_SETTING, 'label': 'Border intensity',
+            'value': float(self._border_intensity), 'min': 0.0, 'max': 2.0,
         })
         settings.append({
-            'name': self._BORDER_HUE_SPEED_SETTING, 'value': float(self._border_hue_speed),
-            'min': 0.0, 'max': 1.0,
+            'name': self._BORDER_HUE_SPEED_SETTING, 'label': 'Border hue speed',
+            'value': float(self._border_hue_speed), 'min': 0.0, 'max': 1.0,
         })
         return settings
 
-    def set_config_setting(self, name: str, value: float) -> None:
+    def set_config_setting(self, name: str, value: float) -> dict[str, object] | None:
+        if name == 'capture_fps':
+            idx = max(0, min(len(self._CAPTURE_FPS_CHOICES) - 1, int(round(value))))
+            self._cam_fps = int(self._CAPTURE_FPS_CHOICES[idx])
+            return {'fps': self._cam_fps}
+        if name == 'capture_size':
+            idx = max(0, min(len(self._CAPTURE_SIZE_CHOICES) - 1, int(round(value))))
+            self._cam_width, self._cam_height = self._CAPTURE_SIZE_CHOICES[idx]
+            return {'width': self._cam_width, 'height': self._cam_height}
+        if name == 'cycle_interval':
+            self._auto_cycle_interval = max(5.0, min(120.0, float(value)))
+            self._auto_cycle_effect_duration = self._auto_cycle_interval / 2.0
+            self._auto_cycle_normal_duration = self._auto_cycle_interval
+            return None
         if name == self._SELFIE_SEG_GROW_SETTING:
             self._selfie_seg_grow_px = max(0, int(round(value)))
             self._push_selfie_seg_tuning()

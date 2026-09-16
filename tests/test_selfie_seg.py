@@ -46,6 +46,10 @@ def _system() -> 'wo.WebcamSystem':
     s._border_style = 'futuristic'
     s._border_intensity = 1.0
     s._border_hue_speed = 0.05
+    s._cam_fps = 30
+    s._cam_width = 1280
+    s._cam_height = 720
+    s._auto_cycle_interval = 30.0
     s._worker = None
     return s
 
@@ -59,6 +63,9 @@ _TUNING_ROWS = [
      'min': 0.0, 'max': 100.0, 'step': 1.0},
     {'name': 'selfie_seg_temporal', 'value': float(wo._SELFIE_SEG_TEMPORAL_DEFAULT),
      'min': 0.0, 'max': 0.95},
+    {'name': 'capture_fps', 'value': 2},
+    {'name': 'capture_size', 'value': 1},
+    {'name': 'cycle_interval', 'value': 30.0, 'min': 5.0, 'max': 120.0},
     {'name': 'border_style', 'value': float(wo._BORDER_STYLES.index('futuristic')),
      'min': 0.0, 'max': float(len(wo._BORDER_STYLES) - 1), 'step': 1.0},
     {'name': 'border_intensity', 'value': 1.0, 'min': 0.0, 'max': 2.0},
@@ -66,9 +73,17 @@ _TUNING_ROWS = [
 ]
 
 
+_CORE_KEYS = ('name', 'value', 'min', 'max', 'step')
+
+
+def _core(rows):
+    """The 1.x row shape (the 2.0 presentation keys are covered separately)."""
+    return [{k: r[k] for k in _CORE_KEYS if k in r} for r in rows]
+
+
 def test_selfie_seg_defaults_off() -> None:
     s = _system()
-    assert s.config_editor_settings() == [
+    assert _core(s.config_editor_settings()) == [
         {'name': 'cam0_selfie_seg', 'value': 0.0, 'min': 0.0, 'max': 3.0, 'step': 1.0},
         {'name': 'cam2_selfie_seg', 'value': 0.0, 'min': 0.0, 'max': 3.0, 'step': 1.0},
         *_TUNING_ROWS,
@@ -86,7 +101,7 @@ def test_config_editor_settings_shows_default_device_when_hidden_at_startup() ->
     s._available_cameras = []
     s._active_device = None
     s._device = 0
-    assert s.config_editor_settings() == [
+    assert _core(s.config_editor_settings()) == [
         {'name': 'cam0_selfie_seg', 'value': 0.0, 'min': 0.0, 'max': 3.0, 'step': 1.0},
         *_TUNING_ROWS,
     ]
@@ -98,7 +113,7 @@ def test_config_editor_settings_includes_persisted_cameras_not_currently_detecte
     s._active_device = None
     s._device = 0
     s._camera_settings = {2: {'selfie_seg': 'transparent'}}
-    result = s.config_editor_settings()
+    result = _core(s.config_editor_settings())
     assert result == [
         {'name': 'cam0_selfie_seg', 'value': 0.0, 'min': 0.0, 'max': 3.0, 'step': 1.0},
         {'name': 'cam2_selfie_seg', 'value': 3.0, 'min': 0.0, 'max': 3.0, 'step': 1.0},
@@ -538,3 +553,22 @@ def test_apply_selfie_seg_survives_a_bad_frame() -> None:
     frame = np.full((2, 2, 3), 123, dtype=np.uint8)
     out = w._apply_selfie_seg(frame)
     assert np.array_equal(out, frame)
+
+
+def test_rows_carry_2_0_presentation_and_capture_rows_are_restart_rows() -> None:
+    s = _system()
+    rows = {r['name']: r for r in s.config_editor_settings()}
+    cam = rows['cam0_selfie_seg']
+    assert (cam['tab'], cam['kind'], cam['choices'], cam['label']) == (
+        'Performance', 'choice', ('OFF', 'DIM', 'BLUR', 'TRANSPARENT'), 'Camera 0 segmentation')
+    assert rows['selfie_seg_blur_px']['display'].endswith(' px')
+    assert rows['capture_fps']['restart'] == 'webcam' and rows['capture_size']['restart'] == 'webcam'
+    assert rows['capture_size']['choices'] == ('640x360', '1280x720', '1920x1080')
+    assert 'tab' not in rows['border_style'] and rows['border_style']['kind'] == 'choice'
+    assert s.set_config_setting('capture_fps', 3.0) == {'fps': 60}
+    assert s._cam_fps == 60
+    assert s.set_config_setting('capture_size', 0.0) == {'width': 640, 'height': 360}
+    assert s.set_config_setting('cycle_interval', 40.0) is None
+    assert (s._auto_cycle_interval, s._auto_cycle_effect_duration,
+            s._auto_cycle_normal_duration) == (40.0, 20.0, 40.0)
+    assert s.set_config_setting('selfie_seg_grow_px', 3.0) is None
