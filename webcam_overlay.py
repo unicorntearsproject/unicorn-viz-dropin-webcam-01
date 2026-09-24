@@ -71,7 +71,7 @@ Editor's Visuals tab, defaulting to `_SELFIE_SEG_GROW_PX_DEFAULT` /
 """
 from __future__ import annotations
 
-__version__ = '1.6.0'
+__version__ = '1.7.0'
 
 import colorsys
 import logging
@@ -134,6 +134,41 @@ _SELFIE_SEG_TEMPORAL_DEFAULT = 0.5
 _SELFIE_SEG_MODES: tuple[str, ...] = ('off', 'dim', 'blur', 'transparent')
 
 log = logging.getLogger(__name__)
+
+# udev's per-device symlinks. by-id carries vendor/model/serial, so it
+# survives a replug into a different USB port; by-path is the fallback for
+# cameras without a serial (stable only while they stay in the same port).
+_V4L_ID_DIRS: tuple[tuple[Path, str], ...] = (
+    (Path('/dev/v4l/by-id'), 'id:'),
+    (Path('/dev/v4l/by-path'), 'path:'),
+)
+_V4L_CAPTURE_SUFFIX = '-video-index0'
+
+
+def _scan_camera_identities() -> dict[int, str]:
+    """Map each /dev/videoN capture index to a name that survives renumbering.
+
+    Reads symlinks only -- never opens a device, so it is safe while the
+    overlay is hidden. Empty on Windows (and on any Linux box without
+    /dev/v4l); callers fall back to the bare index there.
+    """
+    found: dict[int, str] = {}
+    for root, prefix in _V4L_ID_DIRS:
+        try:
+            links = sorted(root.iterdir())
+        except OSError:
+            continue
+        for link in links:
+            if not link.name.endswith(_V4L_CAPTURE_SUFFIX):
+                continue
+            try:
+                target = link.resolve().name
+            except OSError:
+                continue
+            if not target.startswith('video') or not target[5:].isdigit():
+                continue
+            found.setdefault(int(target[5:]), prefix + link.name[:-len(_V4L_CAPTURE_SUFFIX)])
+    return found
 
 # ---------------------------------------------------------------------------
 # Shaders
@@ -557,19 +592,19 @@ class _CameraWorker(threading.Thread):
         while not self._stop_event.is_set():
             with self._device_lock:
                 self._device = int(self._requested_device)
-            cap = None
-            for offset in range(3):
-                cap = self._try_open(self._device + offset)
-                if cap is not None:
-                    if offset:
-                        log.info('WebcamSystem: opened /dev/video%d (fallback)', self._device + offset)
-                    break
+            # Only ever the device asked for. This used to fall through to
+            # N+1 and N+2 when N would not open -- on Linux N+1 is the
+            # camera's own metadata node and N+2 is the *next physical
+            # camera*, which then aired under camera N's per-camera
+            # settings (and was remembered as camera N if adjusted).
+            # WebcamSystem only ever requests enumerated capture indices.
+            cap = self._try_open(self._device)
 
             if cap is None:
                 if initial_open:
                     log.warning(
-                        'WebcamSystem: no camera at device %d..%d — giving up (reconnect and restart)',
-                        self._device, self._device + 2,
+                        'WebcamSystem: no camera at device %d — giving up (reconnect and restart)',
+                        self._device,
                     )
                     return
                 open_failures += 1
@@ -856,7 +891,15 @@ class WebcamSystem:
         self._camera_list_index: int = 0
         self._disabled_cameras: set[int] = set()
         self._active_device: int | None = None
+        # Live settings are keyed by the session's /dev/videoN index; the
+        # persisted copy is keyed by _scan_camera_identities() names so a
+        # camera keeps its settings when USB renumbers it. Settings for a
+        # camera that is not plugged in right now wait in _parked_... so
+        # saving this session does not throw them away.
         self._camera_settings: dict[int, dict[str, float | bool]] = {}
+        self._camera_identities: dict[int, str] = {}
+        self._parked_camera_settings: dict[str, dict[str, Any]] = {}
+        self._parked_disabled_ids: set[str] = set()
         self._brightness = max(0.2, min(2.0, float(cfg.get('brightness', 1.0))))
         self._contrast = max(0.2, min(2.0, float(cfg.get('contrast', 1.0))))
         self._flip_horizontal = str(cfg.get('flip_horizontal', 'true')).lower() != 'false'
@@ -1199,19 +1242,82 @@ class WebcamSystem:
         }
 
     def _apply_camera_settings(self, camera_id: int) -> None:
+        # A key this camera never stored falls back to the configured
+        # default, never to the live value -- the live value belongs to the
+        # camera being switched *away from*. (A camera whose only entry was
+        # a Config Editor segmentation mode used to inherit the previous
+        # camera's brightness/contrast/flips, then remember them as its own.)
         settings = self._camera_settings.get(int(camera_id))
         if not isinstance(settings, dict):
-            self._brightness = float(self._default_brightness)
-            self._contrast = float(self._default_contrast)
-            self._flip_horizontal = bool(self._default_flip_horizontal)
-            self._flip_vertical = bool(self._default_flip_vertical)
-            self._selfie_seg = str(self._default_selfie_seg)
+            settings = {}
+        self._brightness = max(0.2, min(2.0, float(settings.get('brightness', self._default_brightness))))
+        self._contrast = max(0.2, min(2.0, float(settings.get('contrast', self._default_contrast))))
+        self._flip_horizontal = bool(settings.get('flip_horizontal', self._default_flip_horizontal))
+        self._flip_vertical = bool(settings.get('flip_vertical', self._default_flip_vertical))
+        self._selfie_seg = self._parse_selfie_seg_mode(settings.get('selfie_seg', self._default_selfie_seg))
+
+    def _camera_identity(self, camera_id: int) -> str:
+        """Persisted key for a camera: its udev identity, else its bare index."""
+        return self._camera_identities.get(int(camera_id)) or f'index:{int(camera_id)}'
+
+    def _refresh_camera_identities(self) -> None:
+        """Re-read udev identities and move live settings with their cameras.
+
+        Within a session the index is stable unless a camera is replugged;
+        when one is, its settings follow it to the new index here instead of
+        staying on the old number (where a different camera may now sit).
+        A camera that has gone away parks its settings by identity until it
+        comes back.
+        """
+        old = dict(self._camera_identities)
+        new = _scan_camera_identities()
+        if new == old:
             return
-        self._brightness = max(0.2, min(2.0, float(settings.get('brightness', self._brightness))))
-        self._contrast = max(0.2, min(2.0, float(settings.get('contrast', self._contrast))))
-        self._flip_horizontal = bool(settings.get('flip_horizontal', self._flip_horizontal))
-        self._flip_vertical = bool(settings.get('flip_vertical', self._flip_vertical))
-        self._selfie_seg = self._parse_selfie_seg_mode(settings.get('selfie_seg', self._selfie_seg))
+        index_for = {ident: idx for idx, ident in new.items()}
+        rekeyed: dict[int, dict[str, Any]] = {}
+        moved: list[tuple[str, dict[str, Any]]] = []
+        for idx, values in self._camera_settings.items():
+            ident = old.get(idx)
+            if ident is None:
+                rekeyed[idx] = values        # never identified: stays on its index
+            else:
+                moved.append((ident, values))
+        for ident, values in moved:          # a known camera outranks an unidentified entry
+            if ident in index_for:
+                rekeyed[index_for[ident]] = values
+            else:
+                self._parked_camera_settings[ident] = values
+        for ident in list(self._parked_camera_settings):
+            idx = index_for.get(ident)
+            if idx is not None and idx not in rekeyed:
+                rekeyed[idx] = self._parked_camera_settings.pop(ident)
+        self._camera_settings = rekeyed
+
+        disabled = {idx for idx in self._disabled_cameras if idx not in old}
+        for ident in {old[idx] for idx in self._disabled_cameras if idx in old} | self._parked_disabled_ids:
+            idx = index_for.get(ident)
+            if idx is None:
+                self._parked_disabled_ids.add(ident)
+            else:
+                disabled.add(idx)
+                self._parked_disabled_ids.discard(ident)
+        self._disabled_cameras = disabled
+        self._camera_identities = new
+
+    def _persist_runtime_state(self) -> None:
+        """Save now, not only on clean shutdown (a force-quit lost everything).
+
+        The Control Room panel and Config Editor call into this object
+        directly rather than through App's webcam wrappers, which are the
+        only other place that saves.
+        """
+        setter = getattr(getattr(self, '_vj_api', None), 'set_runtime_state', None)
+        if not callable(setter):
+            return
+        try:
+            setter('webcam', self.get_persistence_state())
+        except Exception as exc:
+            log.debug('WebcamSystem: runtime-state save failed: %s', exc)
 
     def scale_pip(self, delta: float) -> float:
         self._pip_scale = max(0.12, min(0.80, self._pip_scale + delta))
@@ -1375,7 +1481,16 @@ class WebcamSystem:
 
     def rediscover_cameras(self) -> list[int]:
         """Re-probe camera devices and refresh enabled/selected state."""
+        self._refresh_camera_identities()
         detected = self._enumerate_cameras()
+        # The probe opens each device, and a V4L2 camera we are streaming
+        # from refuses a second open -- so REDISC while live used to drop
+        # the camera on air from the list, desyncing NEXT/PREV (and which
+        # camera's settings they applied) for the rest of the session.
+        live = self._active_device
+        if (live is not None and live not in detected
+                and self._worker is not None and self._worker.is_alive()):
+            detected = sorted([*detected, int(live)])
         return self._rebuild_camera_list(detected)
 
     def set_camera_enabled(self, camera_id: int, enabled: bool) -> bool:
@@ -1480,6 +1595,7 @@ class WebcamSystem:
             self._selfie_seg = mode
             if self._worker is not None:
                 self._worker.set_selfie_seg_mode(self._selfie_seg)
+        self._persist_runtime_state()
 
     def _push_selfie_seg_tuning(self) -> None:
         """Push the current grow/feather/blur/temporal values to the live capture worker."""
@@ -1660,34 +1776,84 @@ class WebcamSystem:
         index = max(0, min(len(_SELFIE_SEG_MODES) - 1, int(round(value))))
         self.set_camera_selfie_seg(device, _SELFIE_SEG_MODES[index])
 
+    def _parse_camera_settings(self, value: dict[str, Any]) -> dict[str, Any]:
+        """One camera's persisted settings, clamped; gaps take configured defaults."""
+        return {
+            'brightness': max(0.2, min(2.0, float(value.get('brightness', self._default_brightness)))),
+            'contrast': max(0.2, min(2.0, float(value.get('contrast', self._default_contrast)))),
+            'flip_horizontal': bool(value.get('flip_horizontal', self._default_flip_horizontal)),
+            'flip_vertical': bool(value.get('flip_vertical', self._default_flip_vertical)),
+            'selfie_seg': self._parse_selfie_seg_mode(value.get('selfie_seg', self._default_selfie_seg)),
+        }
+
+    @staticmethod
+    def _index_for_identity(identity: str, index_for: dict[str, int]) -> int | None:
+        if identity in index_for:
+            return index_for[identity]
+        if identity.startswith('index:') and identity[6:].isdigit():
+            return int(identity[6:])
+        return None
+
     def apply_persistence_state(self, payload: dict[str, Any]) -> None:
-        """Apply persisted webcam state before startup."""
+        """Apply persisted webcam state before startup.
+
+        Cameras are matched by udev identity (``*_id`` keys) so USB
+        renumbering cannot hand one camera's settings to another. The
+        legacy index-keyed fields are read only when a payload predates
+        the identity keys (the first launch after upgrading).
+        """
         if not isinstance(payload, dict):
             return
-        selected = payload.get('selected_camera')
-        if isinstance(selected, int):
-            self._device = int(selected)
+        self._camera_identities = _scan_camera_identities()
+        index_for = {ident: idx for idx, ident in self._camera_identities.items()}
+        by_id = isinstance(payload.get('per_camera_by_id'), dict)
 
-        disabled = payload.get('disabled_cameras', [])
-        if isinstance(disabled, list):
-            self._disabled_cameras = {int(item) for item in disabled if isinstance(item, int)}
+        selected_id = payload.get('selected_camera_id')
+        selected_idx = (self._index_for_identity(selected_id, index_for)
+                        if isinstance(selected_id, str) else None)
+        if selected_idx is not None:
+            self._device = selected_idx
+        elif isinstance(payload.get('selected_camera'), int) and not by_id:
+            self._device = int(payload['selected_camera'])
 
-        per_camera = payload.get('per_camera', {})
-        camera_settings: dict[int, dict[str, float | bool]] = {}
-        if isinstance(per_camera, dict):
-            for key, value in per_camera.items():
+        self._disabled_cameras = set()
+        self._parked_disabled_ids = set()
+        if by_id:
+            for ident in payload.get('disabled_camera_ids', []) or []:
+                if not isinstance(ident, str):
+                    continue
+                idx = self._index_for_identity(ident, index_for)
+                if idx is None:
+                    self._parked_disabled_ids.add(ident)
+                else:
+                    self._disabled_cameras.add(idx)
+        else:
+            disabled = payload.get('disabled_cameras', [])
+            if isinstance(disabled, list):
+                self._disabled_cameras = {int(item) for item in disabled if isinstance(item, int)}
+
+        camera_settings: dict[int, dict[str, Any]] = {}
+        self._parked_camera_settings = {}
+        if by_id:
+            for ident, value in payload['per_camera_by_id'].items():
                 if not isinstance(value, dict):
                     continue
-                try:
-                    cam_id = int(key)
-                except Exception:
-                    continue
-                camera_settings[cam_id] = {
-                    'brightness': max(0.2, min(2.0, float(value.get('brightness', 1.0)))),
-                    'contrast': max(0.2, min(2.0, float(value.get('contrast', 1.0)))),
-                    'flip_horizontal': bool(value.get('flip_horizontal', True)),
-                    'flip_vertical': bool(value.get('flip_vertical', False)),
-                }
+                idx = self._index_for_identity(str(ident), index_for)
+                if idx is None:
+                    self._parked_camera_settings[str(ident)] = self._parse_camera_settings(value)
+                else:
+                    camera_settings[idx] = self._parse_camera_settings(value)
+        else:
+            per_camera = payload.get('per_camera', {})
+            if isinstance(per_camera, dict):
+                for key, value in per_camera.items():
+                    if not isinstance(value, dict):
+                        continue
+                    try:
+                        cam_id = int(key)
+                    except Exception:
+                        continue
+                    camera_settings[cam_id] = self._parse_camera_settings(value)
         self._camera_settings = camera_settings
 
         self._layout = str(payload.get('layout', self._layout))
@@ -1713,23 +1879,30 @@ class WebcamSystem:
     def get_persistence_state(self) -> dict[str, Any]:
         """Return webcam settings payload for shared runtime persistence."""
         self._remember_current_camera_settings()
+        self._refresh_camera_identities()
         selected_device = self._active_or_default_device()
+        per_camera = {
+            idx: self._parse_camera_settings(values)
+            for idx, values in sorted(self._camera_settings.items())
+        }
+        per_camera_by_id = dict(self._parked_camera_settings)
+        for idx, values in per_camera.items():
+            per_camera_by_id[self._camera_identity(idx)] = values
+        disabled_ids = set(self._parked_disabled_ids)
+        disabled_ids.update(self._camera_identity(idx) for idx in self._disabled_cameras)
         return {
             'selected_camera': int(selected_device),
+            'selected_camera_id': self._camera_identity(selected_device),
             'disabled_cameras': sorted(int(idx) for idx in self._disabled_cameras),
-            'layout': 'hide' if self._hidden else str(self._layout),
+            'disabled_camera_ids': sorted(disabled_ids),
+            # The camera-switch shim hides the PiP for ~1s; saving during
+            # that window used to record the overlay as deliberately hidden.
+            'layout': 'hide' if self._hidden and not self._switch_hide_active else str(self._layout),
             'pip_scale': float(self._pip_scale),
             'treatment': str(self.current_treatment),
             'auto_cycle': bool(self._auto_cycle),
-            'per_camera': {
-                str(cam_id): {
-                    'brightness': float(values.get('brightness', 1.0)),
-                    'contrast': float(values.get('contrast', 1.0)),
-                    'flip_horizontal': bool(values.get('flip_horizontal', True)),
-                    'flip_vertical': bool(values.get('flip_vertical', False)),
-                }
-                for cam_id, values in sorted(self._camera_settings.items(), key=lambda item: item[0])
-            },
+            'per_camera': {str(idx): values for idx, values in per_camera.items()},
+            'per_camera_by_id': dict(sorted(per_camera_by_id.items())),
         }
 
     def webcam_flip_state(self) -> dict[str, bool]:
@@ -1802,8 +1975,14 @@ class WebcamSystem:
             ),
         )
 
-    def _operator_panel_action(self, action: str, _payload: Any) -> str | None:
+    def _operator_panel_action(self, action: str, payload: Any) -> str | None:
         """Handle a Control Room panel button; see registration above."""
+        message = self._run_operator_panel_action(action, payload)
+        if message is not None:
+            self._persist_runtime_state()
+        return message
+
+    def _run_operator_panel_action(self, action: str, _payload: Any) -> str | None:
         if action == 'prev_camera':
             label = self.prev_camera()
             return f'Camera: {label}' if label else 'Camera: only one device'

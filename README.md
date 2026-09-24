@@ -1,6 +1,6 @@
 # webcam-01 — Webcam Overlay
 
-**Version 1.6.0**
+**Version 1.7.0**
 
 A drop-in for [unicorn-viz](https://github.com/iDoMeteor/unicorn-viz).
 
@@ -152,6 +152,24 @@ None of this is configurable from `config.toml` directly — mode is
 inherently per-camera, and the tuning sliders are meant for live
 adjustment while watching the feed.
 
+### Per-camera memory
+
+Each camera keeps its own brightness, contrast, horizontal/vertical flip and
+segmentation mode. Switching cameras (Control Room, hotkeys or MIDI) restores
+that camera's values; a camera never adjusted starts from the `[webcam]`
+defaults, never from the camera you just left. Changes save to the runtime
+store the moment they are made, from the Control Room panel as much as from
+hotkeys, so a force-quit keeps them.
+
+Across restarts, cameras are matched by udev identity
+(`/dev/v4l/by-id`: vendor, model and serial), so replugging into a different
+USB port -- which renumbers `/dev/videoN` -- still brings each camera back
+with its own settings, as do the selected camera and any disabled ones. A
+camera without a serial falls back to `/dev/v4l/by-path` (stable while it
+stays in the same port). Windows has no udev, so there it is keyed by
+device index, as before. Settings for a camera that is unplugged this
+session are kept for when it comes back.
+
 ## Audio reactivity
 
 Only `raw` is silent. Every other treatment reads `iBass`; `glitch`,
@@ -250,6 +268,7 @@ help overlay. `Alt+[` / `Alt+]` also resize the PiP as an alias for
 
 ## Changelog
 
+- **1.7.0** — **Each camera reliably keeps its own settings.** REDISC while a camera is live no longer drops it from the list (a V4L2 camera we stream from fails the probe's second open), which had desynced PREV/NEXT from the camera on air. The capture worker opens only the camera asked for, instead of falling through to /dev/videoN+2 — the next physical camera — and airing it under camera N's settings. A camera with no stored value for a setting gets the configured default, not the previous camera's live value. Settings save immediately from the Control Room panel and Config Editor (not only on clean shutdown), segmentation mode is now saved, a camera-switch blink is no longer saved as "hidden", and cameras are saved by udev identity (by-id serial, by-path fallback) so USB renumbering can't swap their settings; a replug mid-session carries settings to the new index on REDISC. See Per-camera memory.
 - **1.6.0** — Config editor 2.0 rows: segmentation mode per camera and the matte radii move to the Performance tab as labeled choice/slider rows; new capture rate and capture size rows (next launch) and a treatment-cycle row (live) join them. Border rows keep Visuals with proper labels.
 - **1.5.4** — Moved the Control Room panel to the shared `overlays` page
   (was `main`), where it belongs alongside banner/chat/lyrics per
