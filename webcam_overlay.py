@@ -71,7 +71,7 @@ Editor's Visuals tab, defaulting to `_SELFIE_SEG_GROW_PX_DEFAULT` /
 """
 from __future__ import annotations
 
-__version__ = '1.8.0'
+__version__ = '1.9.0'
 
 import colorsys
 import logging
@@ -1674,6 +1674,7 @@ class WebcamSystem:
     _BORDER_STYLE_SETTING = 'border_style'
     _BORDER_INTENSITY_SETTING = 'border_intensity'
     _BORDER_HUE_SPEED_SETTING = 'border_hue_speed'
+    _BORDER_THICKNESS_SETTING = 'border_thickness'
 
     def config_editor_settings(self) -> list[dict[str, float | str]]:
         # Union _available_cameras with anything already known in memory
@@ -1768,6 +1769,12 @@ class WebcamSystem:
             'name': self._BORDER_HUE_SPEED_SETTING, 'label': 'Border hue speed',
             'value': float(self._border_hue_speed), 'min': 0.0, 'max': 1.0,
         })
+        settings.append({
+            'name': self._BORDER_THICKNESS_SETTING, 'label': 'Border thickness',
+            'value': float(self._border_thickness), 'min': 0.0, 'max': 32.0, 'step': 1.0,
+            'display': f'{self._border_thickness:.0f} px',
+            'config': 'webcam.border_thickness',
+        })
         return settings
 
     def set_config_setting(self, name: str, value: float) -> dict[str, object] | None:
@@ -1809,6 +1816,9 @@ class WebcamSystem:
             return
         if name == self._BORDER_HUE_SPEED_SETTING:
             self._border_hue_speed = max(0.0, min(1.0, float(value)))
+            return
+        if name == self._BORDER_THICKNESS_SETTING:
+            self._border_thickness = max(0.0, min(32.0, float(round(value))))
             return
         prefix, suffix = self._SELFIE_SEG_SETTING_PREFIX, self._SELFIE_SEG_SETTING_SUFFIX
         if not (name.startswith(prefix) and name.endswith(suffix)):

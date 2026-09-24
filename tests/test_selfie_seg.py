@@ -25,6 +25,7 @@ import webcam_overlay as wo  # noqa: E402
 
 def _system() -> 'wo.WebcamSystem':
     s = wo.WebcamSystem.__new__(wo.WebcamSystem)
+    s._border_thickness = 8.0
     s._available_cameras = [0, 2]
     s._camera_settings = {}
     s._active_device = 0
@@ -70,6 +71,7 @@ _TUNING_ROWS = [
      'min': 0.0, 'max': float(len(wo._BORDER_STYLES) - 1), 'step': 1.0},
     {'name': 'border_intensity', 'value': 1.0, 'min': 0.0, 'max': 2.0},
     {'name': 'border_hue_speed', 'value': 0.05, 'min': 0.0, 'max': 1.0},
+    {'name': 'border_thickness', 'value': 8.0, 'min': 0.0, 'max': 32.0, 'step': 1.0},
 ]
 
 

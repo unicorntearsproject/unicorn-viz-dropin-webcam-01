@@ -262,6 +262,7 @@ def test_quad_verts_shared_by_cam_and_border_quads_agree_at_zero_pad() -> None:
 
 def _config_system() -> 'wo.WebcamSystem':
     s = wo.WebcamSystem.__new__(wo.WebcamSystem)
+    s._border_thickness = 8.0
     s._available_cameras = []
     s._camera_settings = {}
     s._active_device = None
@@ -284,8 +285,9 @@ def test_config_editor_settings_includes_border_rows() -> None:
     s = _config_system()
     settings = s.config_editor_settings()
     names = [row['name'] for row in settings]
-    assert names[-3:] == ['border_style', 'border_intensity', 'border_hue_speed']
-    style_row = settings[-3]
+    assert names[-4:] == ['border_style', 'border_intensity', 'border_hue_speed',
+                          'border_thickness']
+    style_row = settings[-4]
     assert {k: style_row[k] for k in ('name', 'value', 'min', 'max', 'step')} == {
         'name': 'border_style', 'value': float(wo._BORDER_STYLES.index('futuristic')),
         'min': 0.0, 'max': float(len(wo._BORDER_STYLES) - 1), 'step': 1.0,
@@ -371,3 +373,13 @@ def test_constructor_builds_border_gl_resources(monkeypatch) -> None:
     assert hasattr(system, '_border_prog')
     assert hasattr(system, '_border_vbo')
     assert hasattr(system, '_border_vao')
+
+
+def test_border_thickness_row_round_trips_and_names_its_config_line() -> None:
+    s = _config_system()
+    row = {r['name']: r for r in s.config_editor_settings()}['border_thickness']
+    assert row['value'] == 8.0 and row['config'] == 'webcam.border_thickness'
+    s.set_config_setting('border_thickness', 12.4)
+    assert s._border_thickness == 12.0
+    s.set_config_setting('border_thickness', 99.0)
+    assert s._border_thickness == 32.0
