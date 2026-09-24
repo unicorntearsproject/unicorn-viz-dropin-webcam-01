@@ -71,7 +71,7 @@ Editor's Visuals tab, defaulting to `_SELFIE_SEG_GROW_PX_DEFAULT` /
 """
 from __future__ import annotations
 
-__version__ = '1.7.0'
+__version__ = '1.8.0'
 
 import colorsys
 import logging
@@ -143,6 +143,23 @@ _V4L_ID_DIRS: tuple[tuple[Path, str], ...] = (
     (Path('/dev/v4l/by-path'), 'path:'),
 )
 _V4L_CAPTURE_SUFFIX = '-video-index0'
+_V4L_SYSFS = Path('/sys/class/video4linux')
+_CAMERA_NAME_MAX = 32
+
+
+def _camera_model_name(index: int) -> str:
+    """The camera's V4L2 card name ("C922 Pro Stream Webcam"), or '' if none.
+
+    Reads sysfs only -- never opens the device. Some cameras report the
+    name twice ("USB Camera: USB Camera"); that is folded to one.
+    """
+    try:
+        name = (_V4L_SYSFS / f'video{int(index)}' / 'name').read_text(
+            encoding='utf-8', errors='replace').strip()
+    except OSError:
+        return ''
+    head, sep, tail = name.partition(': ')
+    return head if sep and head == tail else name
 
 
 def _scan_camera_identities() -> dict[int, str]:
@@ -1233,13 +1250,37 @@ class WebcamSystem:
 
     def _remember_current_camera_settings(self, camera_id: int | None = None) -> None:
         target_id = self._active_or_default_device() if camera_id is None else int(camera_id)
-        self._camera_settings[target_id] = {
+        # update(), not replace: the operator's name for this camera is
+        # stored alongside and is not part of the live image state.
+        self._camera_settings.setdefault(target_id, {}).update({
             'brightness': float(self._brightness),
             'contrast': float(self._contrast),
             'flip_horizontal': bool(self._flip_horizontal),
             'flip_vertical': bool(self._flip_vertical),
             'selfie_seg': str(self._selfie_seg),
-        }
+        })
+
+    def camera_label(self, camera_id: int) -> str:
+        """What the operator sees for a camera: their name for it, else its
+        model name, else its device path."""
+        camera_id = int(camera_id)
+        name = self._camera_settings.get(camera_id, {}).get('name')
+        if isinstance(name, str) and name:
+            return name
+        return _camera_model_name(camera_id) or (
+            f'/dev/video{camera_id}' if sys.platform != 'win32' else f'Camera {camera_id}')
+
+    def set_camera_name(self, camera_id: int, name: str) -> str:
+        """Name a camera; an empty name restores the default. Returns the label now shown."""
+        camera_id = int(camera_id)
+        cleaned = ' '.join(str(name).split())[:_CAMERA_NAME_MAX]
+        settings = self._camera_settings.setdefault(camera_id, {})
+        if cleaned:
+            settings['name'] = cleaned
+        else:
+            settings.pop('name', None)
+        self._persist_runtime_state()
+        return self.camera_label(camera_id)
 
     def _apply_camera_settings(self, camera_id: int) -> None:
         # A key this camera never stored falls back to the configured
@@ -1473,6 +1514,7 @@ class WebcamSystem:
             {
                 'id': int(idx),
                 'label': f'/dev/video{idx}' if sys.platform != 'win32' else str(idx),
+                'name': self.camera_label(idx),
                 'enabled': idx not in self._disabled_cameras,
                 'selected': idx == selected,
             }
@@ -1520,10 +1562,12 @@ class WebcamSystem:
         self._rebuild_camera_list(self._detected_cameras)
         if camera_id not in self._available_cameras:
             return None
+        if camera_id == self._active_device and self._worker is not None and self._worker.is_alive():
+            return self.camera_label(camera_id)     # already on air: no switch blink
         self._prepare_camera_switch_hide()
         self._camera_list_index = self._available_cameras.index(camera_id)
         self._restart_worker()
-        return f'/dev/video{camera_id}' if sys.platform != 'win32' else str(camera_id)
+        return self.camera_label(camera_id)
 
     def set_brightness(self, value: float) -> float:
         """Set software brightness multiplier and return clamped value."""
@@ -1784,6 +1828,8 @@ class WebcamSystem:
             'flip_horizontal': bool(value.get('flip_horizontal', self._default_flip_horizontal)),
             'flip_vertical': bool(value.get('flip_vertical', self._default_flip_vertical)),
             'selfie_seg': self._parse_selfie_seg_mode(value.get('selfie_seg', self._default_selfie_seg)),
+            **({'name': ' '.join(value['name'].split())[:_CAMERA_NAME_MAX]}
+               if isinstance(value.get('name'), str) and value['name'].strip() else {}),
         }
 
     @staticmethod
@@ -1936,7 +1982,18 @@ class WebcamSystem:
         )
         devices = self.list_cameras()
         selected = next((d for d in devices if bool(d.get('selected', False))), None)
-        selected_label = str(selected.get('label', '-')) if selected is not None else '-'
+        selected_label = str(selected.get('name', '-')) if selected is not None else '-'
+        selected_id = int(selected['id']) if selected is not None else None
+        # One pad per switchable camera -- none at all for a single camera.
+        pads: list[PanelButton] = []
+        if len(self._available_cameras) >= 2:
+            for idx in self._available_cameras:
+                label = self.camera_label(idx)
+                pads.append(PanelButton(
+                    'select_camera', label, active=idx == selected_id, payload=int(idx),
+                    rename_action='rename_camera',
+                    tooltip=f'Switch to {label} (double-click to rename)',
+                ))
         img_state = self.webcam_image_state()
         brightness = float(img_state.get('brightness', 1.0) or 1.0)
         contrast = float(img_state.get('contrast', 1.0) or 1.0)
@@ -1973,6 +2030,7 @@ class WebcamSystem:
                 PanelButton('flip_h', 'FLIP H', active=bool(img_state.get('flip_horizontal', False)), accent='accent_2'),
                 PanelButton('flip_v', 'FLIP V', active=bool(img_state.get('flip_vertical', False)), accent='accent_2'),
             ),
+            pads=tuple(pads),
         )
 
     def _operator_panel_action(self, action: str, payload: Any) -> str | None:
@@ -1982,7 +2040,17 @@ class WebcamSystem:
             self._persist_runtime_state()
         return message
 
-    def _run_operator_panel_action(self, action: str, _payload: Any) -> str | None:
+    def _run_operator_panel_action(self, action: str, payload: Any) -> str | None:
+        if action == 'select_camera':
+            label = self.set_active_camera(int(payload))
+            return f'Camera: {label}' if label else 'Camera unavailable'
+        if action == 'rename_camera':
+            edit = payload if isinstance(payload, dict) else {}
+            try:
+                camera_id = int(edit.get('payload'))
+            except (TypeError, ValueError):
+                return None
+            return f"Camera named: {self.set_camera_name(camera_id, str(edit.get('text', '')))}"
         if action == 'prev_camera':
             label = self.prev_camera()
             return f'Camera: {label}' if label else 'Camera: only one device'
@@ -2032,6 +2100,11 @@ class WebcamSystem:
             self._active_device,
             self._available_cameras,
         )
+        if self._hidden and not self._switch_hide_active:
+            # Deliberately hidden (not the switch blink): remember the pick,
+            # open nothing -- a camera pad pressed while the PiP is off must
+            # not light the LED. The next show opens this camera.
+            return
         if self._worker is None or not self._worker.is_alive():
             self._worker = _CameraWorker(
                 device, self._cam_width, self._cam_height, self._cam_fps,
@@ -2057,8 +2130,7 @@ class WebcamSystem:
         self._camera_list_index = (self._camera_list_index + 1) % len(self._available_cameras)
         log.debug('WebcamSystem: next camera index -> %d', self._camera_list_index)
         self._restart_worker()
-        dev = self._available_cameras[self._camera_list_index]
-        return f'/dev/video{dev}' if sys.platform != 'win32' else str(dev)
+        return self.camera_label(self._available_cameras[self._camera_list_index])
 
     def prev_camera(self) -> str | None:
         """Switch to the previous detected camera device. Returns a label or None if only one."""
@@ -2068,8 +2140,7 @@ class WebcamSystem:
         self._camera_list_index = (self._camera_list_index - 1) % len(self._available_cameras)
         log.debug('WebcamSystem: prev camera index -> %d', self._camera_list_index)
         self._restart_worker()
-        dev = self._available_cameras[self._camera_list_index]
-        return f'/dev/video{dev}' if sys.platform != 'win32' else str(dev)
+        return self.camera_label(self._available_cameras[self._camera_list_index])
 
     @property
     def current_treatment(self) -> str:

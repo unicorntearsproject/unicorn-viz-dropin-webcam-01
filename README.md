@@ -1,6 +1,6 @@
 # webcam-01 — Webcam Overlay
 
-**Version 1.7.0**
+**Version 1.8.0**
 
 A drop-in for [unicorn-viz](https://github.com/iDoMeteor/unicorn-viz).
 
@@ -155,7 +155,10 @@ adjustment while watching the feed.
 ### Per-camera memory
 
 Each camera keeps its own brightness, contrast, horizontal/vertical flip and
-segmentation mode. Switching cameras (Control Room, hotkeys or MIDI) restores
+segmentation mode, plus an optional name. With two or more cameras the
+Control Room panel shows a pad per camera; double-click a pad to rename it
+(clear the name to go back to the camera's model name). Switching cameras
+(pads, Control Room, hotkeys or MIDI) restores
 that camera's values; a camera never adjusted starts from the `[webcam]`
 defaults, never from the camera you just left. Changes save to the runtime
 store the moment they are made, from the Control Room panel as much as from
@@ -268,6 +271,7 @@ help overlay. `Alt+[` / `Alt+]` also resize the PiP as an alias for
 
 ## Changelog
 
+- **1.8.0** — **Camera pads with names.** With two or more enabled cameras the Control Room panel shows one pad per camera (none for a single camera); a pad switches straight to that camera, and double-clicking it renames it. Unnamed cameras show their model name (read from sysfs, never by opening the device), else their device path. Names are saved per camera identity like the other settings, and appear in the panel's Active row and in camera-switch messages. Picking a camera while the PiP is deliberately hidden now just selects it for the next show instead of opening it (camera privacy), and picking the camera already on air no longer blinks it. Needs core 1.0.0-beta.157.
 - **1.7.0** — **Each camera reliably keeps its own settings.** REDISC while a camera is live no longer drops it from the list (a V4L2 camera we stream from fails the probe's second open), which had desynced PREV/NEXT from the camera on air. The capture worker opens only the camera asked for, instead of falling through to /dev/videoN+2 — the next physical camera — and airing it under camera N's settings. A camera with no stored value for a setting gets the configured default, not the previous camera's live value. Settings save immediately from the Control Room panel and Config Editor (not only on clean shutdown), segmentation mode is now saved, a camera-switch blink is no longer saved as "hidden", and cameras are saved by udev identity (by-id serial, by-path fallback) so USB renumbering can't swap their settings; a replug mid-session carries settings to the new index on REDISC. See Per-camera memory.
 - **1.6.0** — Config editor 2.0 rows: segmentation mode per camera and the matte radii move to the Performance tab as labeled choice/slider rows; new capture rate and capture size rows (next launch) and a treatment-cycle row (live) join them. Border rows keep Visuals with proper labels.
 - **1.5.4** — Moved the Control Room panel to the shared `overlays` page

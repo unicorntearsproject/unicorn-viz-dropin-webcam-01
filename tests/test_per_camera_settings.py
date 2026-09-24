@@ -77,6 +77,7 @@ class _Rig:
     def __init__(self) -> None:
         self.detected = [0, 2, 4]
         self.ids = {0: 'id:C615', 2: 'id:C922', 4: 'id:Generic'}
+        self.models = {0: 'HD Webcam C615', 2: 'C922 Pro Stream Webcam', 4: 'USB Camera'}
 
 
 @pytest.fixture
@@ -85,6 +86,7 @@ def rig(monkeypatch: pytest.MonkeyPatch) -> _Rig:
     monkeypatch.setattr(wo, '_CV2', True)
     monkeypatch.setattr(wo, '_CameraWorker', _FakeWorker)
     monkeypatch.setattr(wo, '_scan_camera_identities', lambda: dict(r.ids))
+    monkeypatch.setattr(wo, '_camera_model_name', lambda idx: r.models.get(idx, ''))
     monkeypatch.setattr(wo.WebcamSystem, '_enumerate_cameras', staticmethod(lambda: list(r.detected)))
     return r
 
@@ -302,3 +304,114 @@ def test_scan_camera_identities_without_v4l_is_empty(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(wo, '_V4L_ID_DIRS', ((tmp_path / 'missing', 'id:'),))
     assert wo._scan_camera_identities() == {}
+
+
+# ------------------------------------------------------ camera pads and names
+
+def _pads(s: 'wo.WebcamSystem') -> list[tuple[int, str, bool]]:
+    return [(b.payload, b.label, b.active) for b in s._operator_panel_content().pads]
+
+
+def test_one_pad_per_camera_with_the_active_one_lit(rig) -> None:
+    s = _boot()
+    assert _pads(s) == [
+        (0, 'HD Webcam C615', True),
+        (2, 'C922 Pro Stream Webcam', False),
+        (4, 'USB Camera', False),
+    ]
+    pad = s._operator_panel_content().pads[1]
+    assert pad.action == 'select_camera' and pad.rename_action == 'rename_camera'
+
+
+def test_a_single_camera_gets_no_pads(rig) -> None:
+    rig.detected = [2]
+    s = _boot()
+    assert s._operator_panel_content().pads == ()
+
+
+def test_disabled_cameras_get_no_pad(rig) -> None:
+    s = _boot()
+    s.set_camera_enabled(4, False)
+    assert [p[0] for p in _pads(s)] == [0, 2]
+
+
+def test_pad_switches_camera_and_saves(rig) -> None:
+    s = _boot()
+    assert s._operator_panel_action('select_camera', 4) == 'Camera: USB Camera'
+    assert s._active_device == 4
+    assert s._vj_api.saved['selected_camera_id'] == 'id:Generic'
+
+
+def test_pad_for_the_camera_on_air_does_not_blink_it(rig) -> None:
+    s = _boot()
+    s._operator_panel_action('select_camera', 0)
+    assert s._hidden is False and s._switch_hide_active is False
+
+
+def test_rename_shows_everywhere_and_survives_a_restart(rig) -> None:
+    s = _boot()
+    msg = s._operator_panel_action('rename_camera', {'payload': 2, 'text': '  Overhead   decks '})
+    assert msg == 'Camera named: Overhead decks'
+    assert _pads(s)[1][1] == 'Overhead decks'
+    s._operator_panel_action('select_camera', 2)
+    assert {r.label: r.value for r in s._operator_panel_content().rows}['Active'] == 'Overhead decks'
+    saved = s._vj_api.saved
+    assert saved['per_camera_by_id']['id:C922']['name'] == 'Overhead decks'
+    rig.ids = {0: 'id:C922', 2: 'id:C615', 4: 'id:Generic'}      # renumbered
+    s2 = _boot(saved)
+    assert _pads(s2)[0][1] == 'Overhead decks'
+
+
+def test_name_survives_adjusting_that_camera(rig) -> None:
+    s = _boot()
+    s.set_camera_name(0, 'Booth')
+    _act(s, 'brightness_up', 'flip_v')
+    assert s.camera_label(0) == 'Booth'
+
+
+def test_empty_name_restores_the_model_name(rig) -> None:
+    s = _boot()
+    s.set_camera_name(4, 'Crowd')
+    assert s.set_camera_name(4, '   ') == 'USB Camera'
+    assert 'name' not in s._vj_api.saved['per_camera_by_id']['id:Generic']
+
+
+def test_names_are_capped(rig) -> None:
+    s = _boot()
+    assert s.set_camera_name(0, 'x' * 50) == 'x' * wo._CAMERA_NAME_MAX
+
+
+def test_rename_with_a_bad_payload_is_ignored(rig) -> None:
+    s = _boot()
+    assert s._operator_panel_action('rename_camera', {'payload': None, 'text': 'x'}) is None
+    assert s._vj_api.saves == 0
+
+
+def test_label_falls_back_to_the_device_path(rig) -> None:
+    rig.models = {}
+    s = _boot()
+    expected = '/dev/video2' if sys.platform != 'win32' else 'Camera 2'
+    assert s.camera_label(2) == expected
+
+
+def test_picking_a_pad_while_hidden_opens_no_camera(rig) -> None:
+    s = _boot()
+    s.set_layout('hide')                        # deliberate hide releases the camera
+    assert s._worker is None
+    s._operator_panel_action('select_camera', 4)
+    assert s._worker is None                    # LED stays off
+    assert s._active_device == 4
+    s.set_layout('3')
+    assert s._worker is not None and s._worker.device == 4
+
+
+def test_camera_model_name_reads_sysfs_and_folds_doubled_names(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    for idx, name in ((0, 'HD Webcam C615\n'), (4, 'USB Camera: USB Camera\n'), (6, 'Cam: Front\n')):
+        (tmp_path / f'video{idx}').mkdir()
+        (tmp_path / f'video{idx}' / 'name').write_text(name)
+    monkeypatch.setattr(wo, '_V4L_SYSFS', tmp_path)
+    assert wo._camera_model_name(0) == 'HD Webcam C615'
+    assert wo._camera_model_name(4) == 'USB Camera'
+    assert wo._camera_model_name(6) == 'Cam: Front'
+    assert wo._camera_model_name(2) == ''

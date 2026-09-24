@@ -24,9 +24,17 @@ import webcam_overlay as wo  # noqa: E402
 from unicornviz.operator_panels import OperatorPanel, PanelContent  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _no_host_camera_names(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Default camera names come from sysfs; keep these tests off the host's
+    real cameras so labels fall back to the device path."""
+    monkeypatch.setattr(wo, '_camera_model_name', lambda _idx: '')
+
+
 def _system(**overrides) -> 'wo.WebcamSystem':
     s = wo.WebcamSystem.__new__(wo.WebcamSystem)
     s.enabled = True
+    s._camera_settings = {}
     s._detected_cameras = [0]
     s._active_device = 0
     s._available_cameras = [0]
